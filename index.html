@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quantum Dot Suite</title>
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet">
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ['Inter', 'sans-serif'],
+              heading: ['"Plus Jakarta Sans"', 'sans-serif'],
+              mono: ['"JetBrains Mono"', 'monospace'],
+            },
+            colors: {
+              brand: {
+                50: '#eef2ff',
+                100: '#e0e7ff',
+                500: '#6366f1',
+                600: '#4f46e5', // Deep Indigo
+                700: '#4338ca',
+                900: '#312e81',
+              },
+              accent: {
+                50: '#fff1f2',
+                100: '#ffe4e6',
+                500: '#f43f5e',
+                600: '#e11d48', // Coral / Rose
+              }
+            },
+            boxShadow: {
+              'soft': '0 8px 30px rgba(0, 0, 0, 0.04)',
+              'glow': '0 4px 20px rgba(99, 102, 241, 0.3)',
+            }
+          }
+        }
+      }
+    </script>
+  </head>
+  <body class="bg-slate-50 text-slate-800 antialiased selection:bg-brand-100 selection:text-brand-900">
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
+
