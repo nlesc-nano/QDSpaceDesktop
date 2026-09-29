@@ -200,11 +200,9 @@
       const res = await fetch(url, { method: 'POST' });
       if (!res.ok) throw new Error(`Health HTTP ${res.status}`);
       health = await res.json();
-    } catch (e) {
+    } catch {
       health = null;
-      error =
-        `Cannot reach MACE sidecar at ${SIDECAR_BASE}. ` +
-        `Start it with: npm run sidecar  (${e.message})`;
+      error = 'Property prediction is not included in this installer yet.';
     }
   }
 

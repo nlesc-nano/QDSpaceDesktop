@@ -3,6 +3,13 @@
   import Viewer from './Viewer.svelte';
   import { isDesktopApp } from './lib/desktop.js';
 
+  const BUILDER_NOT_INCLUDED = 'The structure builder is not included in this installer yet.';
+
+  function localBuilderMissing(err) {
+    const msg = err && err.message ? String(err.message) : String(err ?? '');
+    return err instanceof TypeError || /failed to fetch|networkerror|load failed|network request failed/i.test(msg);
+  }
+
   // --- Common Oxidation States for QD Elements & Ligands ---
   const OXIDATION_STATES = {
     'Cd': 2, 'Zn': 2, 'Pb': 2, 'Hg': 2, 'Mg': 2, 'Ca': 2, 'Sr': 2, 'Ba': 2,
@@ -787,7 +794,9 @@
         throw new Error(data.error || 'Unknown error');
       }
     } catch (err) {
-      logs += `[warn] CIF facet analysis failed: ${err.message}. Facet family selections will remain custom.\n`;
+      logs += localBuilderMissing(err)
+        ? `[warn] ${BUILDER_NOT_INCLUDED}\n`
+        : `[warn] CIF facet analysis failed: ${err.message}. Facet family selections will remain custom.\n`;
       detectedFacets = [];
       currentCorePhase = null;
       detectedAnions = [];
@@ -1177,7 +1186,9 @@
         logs += "[error] Build failed.\n";
       }
     } catch (err) {
-      logs += `[error] fetch failed: ${err.message}\n`;
+      logs += localBuilderMissing(err)
+        ? `[error] ${BUILDER_NOT_INCLUDED}\n`
+        : `[error] fetch failed: ${err.message}\n`;
     } finally {
       isBuilding = false;
     }

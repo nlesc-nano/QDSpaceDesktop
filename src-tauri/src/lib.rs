@@ -25,14 +25,18 @@ fn listening(port: u16) -> bool {
 }
 
 fn project_root() -> Option<std::path::PathBuf> {
-  let mut candidates = Vec::new();
-  if let Ok(root) = std::env::var("QDSPACE_ROOT") {
-    candidates.push(std::path::PathBuf::from(root));
+  // Developer override only. A downloaded installer must not search
+  // %USERPROFILE%\Downloads\Desktop App or launch Python/Docker from it.
+  let Ok(root) = std::env::var("QDSPACE_ROOT") else {
+    return None;
+  };
+  let root = root.trim();
+  if root.is_empty() {
+    return None;
   }
-  if let Ok(home) = std::env::var("USERPROFILE") {
-    candidates.push(std::path::PathBuf::from(home).join("Downloads").join("Desktop App"));
-  }
-  candidates.into_iter().find(|path| path.join("sidecar").join("sidecar_app.py").is_file())
+  let path = std::path::PathBuf::from(root);
+  let sidecar_script = path.join("sidecar").join("sidecar_app.py");
+  if sidecar_script.is_file() { Some(path) } else { None }
 }
 
 fn hidden(cmd: &mut std::process::Command) {
@@ -46,7 +50,7 @@ fn hidden(cmd: &mut std::process::Command) {
 
 fn start_local_services() {
   let Some(root) = project_root() else {
-    eprintln!("QDSpace project folder was not found, so the sidecar and Builder were not started.");
+    // No sidecar script and no structure builder in a normal install: open the window only.
     return;
   };
 
