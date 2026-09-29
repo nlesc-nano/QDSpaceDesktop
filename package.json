@@ -25,6 +25,6 @@
     "vite": "^7.3.1"
   },
   "dependencies": {
-    "matterviz": "^0.3.7"
+    "matterviz": "^0.7.0"
   }
 }
