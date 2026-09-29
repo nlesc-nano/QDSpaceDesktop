@@ -1,0 +1,30 @@
+{
+  "name": "qdspace-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "QDSpace Desktop \u2014 Tauri + Vite/Svelte UI + local MACE sidecar",
+  "scripts": {
+    "dev": "vite",
+    "dev:desktop": "cross-env VITE_APP_TARGET=desktop vite",
+    "build": "vite build",
+    "build:desktop": "node scripts/stage-public.mjs && cross-env VITE_APP_TARGET=desktop vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "cross-env VITE_APP_TARGET=desktop tauri dev",
+    "tauri:build": "cross-env VITE_APP_TARGET=desktop tauri build",
+    "sidecar": "node scripts/run-sidecar.mjs",
+    "sidecar:health": "curl -s -X POST http://127.0.0.1:8765/health | python3 -m json.tool",
+    "sidecar:unix": "cd sidecar && .venv/bin/uvicorn sidecar_app:app --host 127.0.0.1 --port 8765"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6.2.1",
+    "@tauri-apps/cli": "^2.12.0",
+    "cross-env": "^7.0.3",
+    "svelte": "^5.45.2",
+    "vite": "^7.3.1"
+  },
+  "dependencies": {
+    "matterviz": "^0.3.7"
+  }
+}

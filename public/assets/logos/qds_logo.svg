@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+  <defs>
+    <!-- palette to match your Builder/Library style -->
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"  stop-color="#5BB6C2"/>
+      <stop offset="1"  stop-color="#2C6C7A"/>
+    </linearGradient>
+    <linearGradient id="facet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"  stop-color="#FFC44D"/>
+      <stop offset="1"  stop-color="#F59E0B"/>
+    </linearGradient>
+    <style>
+      .edge {stroke:#173B47; stroke-width:3; stroke-linejoin:round}
+      .bond {stroke:#173B47; stroke-width:4; stroke-linecap:round}
+      .node {fill:#173B47}
+    </style>
+  </defs>
+
+  <!-- 3D hexagon (isometric) -->
+  <!-- back left/right faces -->
+  <polygon class="edge" fill="url(#body)"
+           points="30,40 60,24 90,40 90,80 60,96 30,80"/>
+  <!-- front vertical edge to accent depth -->
+  <line class="edge" x1="60" y1="24" x2="60" y2="96"/>
+
+  <!-- top facet (triangular highlight) -->
+  <polygon class="edge" fill="url(#facet)"
+           points="60,24 90,40 60,54"/>
+
+  <!-- ligands: three bonds + terminal spheres -->
+  <!-- right-up ligand -->
+  <line class="bond" x1="90" y1="40" x2="110" y2="24"/>
+  <circle class="node" cx="110" cy="24" r="6"/>
+  <!-- bottom-right ligand -->
+  <line class="bond" x1="90" y1="80" x2="108" y2="92"/>
+  <circle class="node" cx="108" cy="92" r="6"/>
+  <!-- left-mid ligand -->
+  <line class="bond" x1="30" y1="60" x2="12"  y2="60"/>
+  <circle class="node" cx="12" cy="60" r="6"/>
+</svg>
+
+
+

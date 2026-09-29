@@ -1,0 +1,9 @@
+# CPU-only MACE sidecar. Install torch from the CPU index first if needed:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2
+numpy>=1.26
+ase>=3.22
+mace-torch>=0.3.14
