@@ -140,10 +140,16 @@ async function buildWindows() {
   const pthName = fs.readdirSync(runtime).find((name) => name.endsWith('._pth'));
   if (!pthName) fail('embeddable Python did not include a ._pth file');
   const pthPath = path.join(runtime, pthName);
-  let text = fs.readFileSync(pthPath, 'utf8').replace(/^\uFEFF/, '');
-  text = text.replace(/^\s*#\s*import site\s*$/m, 'import site');
-  if (!/^import site\s*$/m.test(text)) text = `${text.replace(/\s*$/, '')}\nimport site\n`;
-  fs.writeFileSync(pthPath, text.replace(/\r\n/g, '\n'), 'utf8');
+  const sitePackages = path.join(runtime, 'Lib', 'site-packages');
+  fs.mkdirSync(sitePackages, { recursive: true });
+  // The embed zip ignores Lib\\site-packages unless that folder is listed in
+  // python*._pth. Uncommenting "import site" alone still leaves pip invisible,
+  // which is why "python -m pip" said "No module named pip" after get-pip.
+  let text = fs.readFileSync(pthPath, 'utf8').replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
+  const lines = text.split('\n').map((line) => line.trimEnd()).filter((line) => line.length > 0);
+  const kept = lines.filter((line) => line !== 'import site' && line !== '#import site' && line !== '# import site' && line !== 'Lib\\site-packages' && line !== 'Lib/site-packages');
+  const body = [...kept, 'Lib\\site-packages', 'import site'].join('\n') + '\n';
+  fs.writeFileSync(pthPath, body, 'utf8');
 
   const py = path.join(runtime, 'python.exe');
   if (!fs.existsSync(py)) fail(`python.exe missing after extracting ${EMBED_URL}`);
