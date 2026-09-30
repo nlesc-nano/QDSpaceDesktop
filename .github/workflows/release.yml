@@ -18,7 +18,7 @@ jobs:
           - platform: windows-latest
             args: ""
           - platform: ubuntu-22.04
-            args: ""
+            args: "--verbose"
           - platform: macos-latest
             args: "--target aarch64-apple-darwin"
           - platform: macos-latest
@@ -57,6 +57,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # linuxdeploy is an AppImage. GitHub's Ubuntu runner has no usable FUSE, so libfuse2 alone still fails to start it.
           APPIMAGE_EXTRACT_AND_RUN: "1"
+          # linuxdeploy's bundled strip dies on modern libraries and reports only "failed to run linuxdeploy".
+          NO_STRIP: "true"
         with:
           tagName: v__VERSION__
           releaseName: QDSpace Desktop v__VERSION__
