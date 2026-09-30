@@ -350,12 +350,13 @@
 
       <div class="space-y-1.5">
         <p class="text-xs font-bold uppercase tracking-wide text-slate-700">Model</p>
-        <button class="w-full px-3 py-2 rounded-lg text-xs font-medium border border-slate-200 text-slate-700 hover:bg-slate-50 text-left truncate" onclick={() => modelInput?.click()}>
-          {modelName || (engineChoice === 'nequip' ? 'Choose a NequIP file' : 'Built-in MACE model')}
-        </button>
+        <div class="grid grid-cols-2 rounded-lg border border-slate-200 p-0.5 bg-white">
+          <button class="px-3 py-1.5 rounded-md text-xs font-medium {!modelName && engineChoice === 'mace' ? 'bg-brand-50 text-brand-600' : 'text-slate-500 hover:text-slate-800'}" onclick={() => { modelPath = ''; modelName = ''; refreshHeads(); }}>Use built-in model</button>
+          <button class="px-3 py-1.5 rounded-md text-xs font-medium {modelName ? 'bg-brand-50 text-brand-600' : 'text-slate-500 hover:text-slate-800'}" onclick={() => modelInput?.click()}>Load model</button>
+        </div>
         <input bind:this={modelInput} type="file" accept=".model,.pth,.pt,.pt2,.zip" class="hidden" onchange={onModelFile} />
-        {#if modelName && engineChoice === 'mace'}
-          <button class="text-xs text-slate-500 hover:text-slate-800" onclick={() => { modelPath = ''; modelName = ''; refreshHeads(); }}>Use built-in model</button>
+        {#if modelName}
+          <p class="px-1 text-xs text-slate-500 truncate">{modelName}</p>
         {/if}
         {#if engineChoice === 'mace' && heads.length > 1}
           <select class="w-full px-3 py-2 rounded-lg text-xs border border-slate-200 bg-white" bind:value={headChoice}>
