@@ -55,6 +55,8 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # linuxdeploy is an AppImage. GitHub's Ubuntu runner has no usable FUSE, so libfuse2 alone still fails to start it.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         with:
           tagName: v__VERSION__
           releaseName: QDSpace Desktop v__VERSION__
