@@ -35,6 +35,15 @@ sidecar/__pycache__/
 # Generated desktop catalog for the installer
 public-release/
 
-# Local model files. GitHub rejects files over 100 MB.
+# Built CPU MACE runtime (scripts/build-mace-runtime.mjs). Contents are not
+# committed; release CI fills mace-runtime/ before tauri-action. Keep the
+# directory itself so `tauri.conf.json` bundle.resources can resolve at build.
+mace-runtime/*
+!mace-runtime/.gitkeep
+qdspace-mace-runtime/
+
+# Local model drops. The default MACE-MP-0 large checkpoint is ~61 MB
+# (under GitHub's 100 MB limit) and IS committed so installer CI can pack it.
 sidecar/models/*
 !sidecar/models/.gitkeep
+!sidecar/models/2024-01-07-mace-128-L2_epoch-199.model

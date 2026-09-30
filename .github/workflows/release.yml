@@ -1,4 +1,4 @@
-﻿name: release
+name: release
 
 on:
   push:
@@ -10,6 +10,7 @@ jobs:
   publish:
     permissions:
       contents: write
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +31,11 @@ jobs:
         with:
           node-version: 22
 
+      - uses: actions/setup-python@v5
+        if: matrix.platform != 'windows-latest'
+        with:
+          python-version: "3.11"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
@@ -43,13 +49,19 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Build bundled CPU MACE runtime
+        run: node scripts/build-mace-runtime.mjs
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: v__VERSION__
           releaseName: QDSpace Desktop v__VERSION__
-          releaseBody: Installers for Windows, Linux, and macOS. The MACE sidecar and structure library are not inside these files.
+          releaseBody: |
+            Installers for Windows, Linux, and macOS.
+            The CPU MACE sidecar is included (Python 3.11 and a CPU PyTorch build of MACE, started on 127.0.0.1:8765).
+            The structure library and the Builder Docker image are still not included.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

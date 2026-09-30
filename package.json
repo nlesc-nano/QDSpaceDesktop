@@ -14,6 +14,7 @@
     "tauri:dev": "cross-env VITE_APP_TARGET=desktop tauri dev",
     "tauri:build": "cross-env VITE_APP_TARGET=desktop tauri build",
     "sidecar": "node scripts/run-sidecar.mjs",
+    "mace-runtime": "node scripts/build-mace-runtime.mjs",
     "sidecar:health": "curl -s -X POST http://127.0.0.1:8765/health | python3 -m json.tool",
     "sidecar:unix": "cd sidecar && .venv/bin/uvicorn sidecar_app:app --host 127.0.0.1 --port 8765"
   },

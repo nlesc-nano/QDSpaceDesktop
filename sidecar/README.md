@@ -17,9 +17,16 @@ Expected path:
 sidecar/models/2024-01-07-mace-128-L2_epoch-199.model
 ```
 
-(~61 MB). This desktop tree already includes the checkpoint when copied from the ML spike.
-If missing, download MACE-MP-0 large from the [MACE foundation models](https://github.com/ACEsuit/mace)
-release assets / Hugging Face and place it at that path (filename must match, or edit `MODEL_PATH` in `sidecar_app.py`).
+(~61 MB). This file is committed (it is under GitHub's 100 MB limit) so release CI can pack it.
+Other files in `sidecar/models/` stay gitignored.
+
+If it is missing, `scripts/build-mace-runtime.mjs` downloads the public MACE-MP-0 large asset and fails if that download is not a real checkpoint:
+
+```
+https://github.com/ACEsuit/mace-foundations/releases/download/mace_mp_0/2024-01-07-mace-128-L2_epoch-199.model
+```
+
+The filename must match, or edit `DEFAULT_MODEL` in `mace_engine.py`.
 
 ## Setup (Windows / Linux / macOS)
 
