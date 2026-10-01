@@ -1,3 +1,8 @@
+<script module>
+  // Survives leaving Predict. Only successful head discovery is kept, never an error.
+  let keptHeads = null;
+</script>
+
 <script>
   import { SIDECAR_BASE } from './lib/desktop.js';
   import Viewer from './Viewer.svelte';
@@ -23,7 +28,6 @@
   let loading = $state(false);
   let error = $state(null);
   let result = $state(null);
-  let health = $state(null);
   let clientMs = $state(null);
   let fileNote = $state(null);
   let structureName = $state('');
@@ -57,6 +61,14 @@
   let pythonNote = $state('');
   let userPythonOn = $state(false);
   let installPrompt = $state(null);
+  let installing = $state(false);
+  let installCancelling = $state(false);
+  let installPercent = $state(null);
+  let installPackage = $state('');
+  let installLog = $state([]);
+  let installLogEl = $state(null);
+  let installGen = 0;
+  let predictBlockNote = $state('');
 
   async function tauriInvoke(command, args) {
     const internals = typeof window !== 'undefined' ? window.__TAURI_INTERNALS__ : null;
@@ -103,7 +115,7 @@
     const device = info?.device || 'CPU';
     const torch = info?.torch ? ` · torch ${info.torch}` : '';
     const installed = info?.installedMace ? ' Installed the missing libraries into this environment.' : '';
-    pythonNote = `Using your Python · ${device}${torch}.${installed} ${info?.python || python}`;
+    pythonNote = `Using this Python · ${device}${torch}.${installed} ${info?.python || python}`;
     if (info?.python) pythonPath = info.python;
   }
 
@@ -111,21 +123,87 @@
     installPrompt = null;
   }
 
+  function isCancelError(e) {
+    return invokeError(e).startsWith('Install cancelled');
+  }
+
+  function pythonStatusText() {
+    if (installing) {
+      const name = installPackage ? `Installing ${installPackage}…` : 'Installing into this Python…';
+      return installPercent != null ? `${name} ${installPercent}%` : name;
+    }
+    if (pythonBusyLabel === 'Checking…') return 'Checking this Python…';
+    if (pythonBusyLabel === 'Installing…') return 'Installing into this Python…';
+    return 'Starting your Python…';
+  }
+
+  function notePredictBlocked() {
+    predictBlockNote = 'Install is in progress. Cancel it or wait.';
+  }
+
+  async function watchInstall(gen) {
+    while (installing && installGen === gen) {
+      try {
+        const status = await tauriInvoke('python_install_status');
+        if (!installing || installGen !== gen) return;
+        if (status?.running) {
+          installPackage = typeof status.package === 'string' ? status.package : '';
+          installPercent = typeof status.percent === 'number' ? status.percent : null;
+          installLog = Array.isArray(status.lines) ? status.lines : [];
+          if (installLogEl) installLogEl.scrollTop = installLogEl.scrollHeight;
+        }
+      } catch {
+        /* keep the last progress line */
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+
+  async function cancelRunningInstall() {
+    if (!installing || installCancelling) return;
+    const gen = installGen;
+    installCancelling = true;
+    try {
+      for (let attempt = 0; attempt < 20 && installing && installGen === gen; attempt += 1) {
+        await tauriInvoke('cancel_python_install');
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    } catch (e) {
+      if (installGen === gen) error = invokeError(e);
+    }
+  }
+
   async function confirmInstall() {
     if (!installPrompt || pythonBusy) return;
     const pending = installPrompt;
     installPrompt = null;
     error = null;
+    predictBlockNote = '';
+    const gen = ++installGen;
+    installing = true;
+    installCancelling = false;
+    installPercent = null;
+    installPackage = '';
+    installLog = [];
     pythonBusy = true;
     pythonBusyLabel = 'Installing…';
+    const watch = watchInstall(gen);
     try {
       await finishUserPython(pending.python, pending.missing.slice());
     } catch (e) {
-      userPythonOn = false;
-      pythonNote = '';
-      error = invokeError(e);
+      if (!isCancelError(e)) {
+        userPythonOn = false;
+        pythonNote = '';
+        error = invokeError(e);
+      }
     } finally {
-      pythonBusy = false;
+      if (installGen === gen) {
+        installing = false;
+        installCancelling = false;
+        pythonBusy = false;
+        predictBlockNote = '';
+      }
+      await watch;
     }
   }
 
@@ -172,7 +250,7 @@
     headChoice = selected || (heads.length ? heads[0] : '');
   }
 
-  async function refreshHeads() {
+  async function refreshHeads({ reportError = true } = {}) {
     if (engineChoice !== 'mace') {
       applyHeads([], '');
       return;
@@ -183,7 +261,16 @@
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       applyHeads(data.heads, data.selected);
+      keptHeads = {
+        found: Array.isArray(data.heads) ? data.heads : [],
+        selected: data.selected || '',
+      };
     } catch (e) {
+      if (!reportError) {
+        if (keptHeads) applyHeads(keptHeads.found, keptHeads.selected);
+        return;
+      }
+      keptHeads = null;
       applyHeads([], '');
       error = e.message || String(e);
     }
@@ -459,20 +546,6 @@
     URL.revokeObjectURL(a.href);
   }
 
-  async function checkHealth(warmup = false) {
-    error = null;
-    try {
-      const url = `${SIDECAR_BASE}/health${warmup ? '?warmup=true' : ''}`;
-      const res = await fetch(url, { method: 'POST' });
-      if (!res.ok) throw new Error(`Health HTTP ${res.status}`);
-      health = await res.json();
-    } catch {
-      health = null;
-      error = 'Property prediction is not included in this installer yet.';
-    }
-  }
-
-
   async function loadStructureFile(file) {
     if (!file) return;
     error = null;
@@ -585,6 +658,11 @@
   }
 
   async function runPredict() {
+    if (installing) {
+      notePredictBlocked();
+      return;
+    }
+    predictBlockNote = '';
     loading = true;
     error = null;
     result = null;
@@ -628,7 +706,8 @@
       loading = false;
     }
   }
-  refreshHeads();
+  if (keptHeads) applyHeads(keptHeads.found, keptHeads.selected);
+  refreshHeads({ reportError: false });
 </script>
 
 <div class="flex h-[calc(100vh-64px)] min-h-[640px] overflow-hidden">
@@ -638,9 +717,17 @@
     </div>
 
     <div class="flex flex-col gap-3">
-      <button type="button" class="w-full px-4 py-2.5 rounded-lg text-sm font-semibold bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50" onclick={runPredict} disabled={loading}>
-        {loading ? 'Predicting…' : 'Run predict'}
-      </button>
+      <div class="relative">
+        <button type="button" class="w-full px-4 py-2.5 rounded-lg text-sm font-semibold bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50" onclick={runPredict} disabled={loading || installing}>
+          {loading ? 'Predicting…' : 'Run predict'}
+        </button>
+        {#if installing}
+          <button type="button" class="absolute inset-0 cursor-not-allowed rounded-lg" aria-label="Install in progress" onclick={notePredictBlocked}></button>
+        {/if}
+      </div>
+      {#if predictBlockNote}
+        <p class="text-xs text-slate-600">{predictBlockNote}</p>
+      {/if}
 
       <div>
         <span class="block text-sm font-bold text-slate-700 uppercase tracking-widest mb-2">Engine</span>
@@ -749,29 +836,33 @@
           <input class="min-w-0 flex-1 px-3 py-2 rounded-lg text-xs border border-slate-200 bg-white" spellcheck="false" placeholder="C:\Users\...\anaconda3\envs\qdspace-user\python.exe" bind:value={pythonPath} disabled={pythonBusy} onkeydown={(event) => { if (event.key === 'Enter') useMyPython(); }} />
           <button type="button" class="px-3 py-2 rounded-lg text-xs font-medium border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-50" onclick={onBrowsePython} disabled={pythonBusy}>Browse</button>
         </div>
-        <button type="button" class="w-full px-3 py-2 rounded-lg text-sm font-bold transition-all border border-slate-200 {userPythonOn ? 'bg-white text-brand-600 shadow-sm' : 'text-slate-700 hover:text-slate-900 hover:bg-slate-50'} disabled:opacity-50" onclick={useMyPython} disabled={pythonBusy || !!installPrompt}>{pythonBusy ? pythonBusyLabel : 'Use my Python'}</button>
-        {#if pythonBusy}
+        <button type="button" class="w-full px-3 py-2 rounded-lg text-sm font-bold transition-all border border-slate-200 {userPythonOn ? 'bg-white text-brand-600 shadow-sm' : 'text-slate-700 hover:text-slate-900 hover:bg-slate-50'} disabled:opacity-50" onclick={useMyPython} disabled={pythonBusy || !!installPrompt}>{pythonBusy ? pythonBusyLabel : 'Use this Python'}</button>
+        {#if installing}
+          <div class="space-y-1.5 px-1" role="status" aria-live="polite">
+            <div class="flex items-center gap-2">
+              <p class="min-w-0 flex-1 truncate text-xs font-medium text-brand-700">{pythonStatusText()}</p>
+              <button type="button" class="shrink-0 rounded-lg border border-red-200 px-2.5 py-1 text-xs font-semibold text-red-600 hover:bg-red-50 disabled:opacity-50" onclick={cancelRunningInstall} disabled={installCancelling}>{installCancelling ? 'Cancelling…' : 'Cancel'}</button>
+            </div>
+            <div class="h-1.5 w-full overflow-hidden rounded-full bg-slate-200" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={installPercent ?? undefined}>
+              {#if installPercent != null}
+                <div class="h-full rounded-full bg-brand-600" style="width: {Math.max(0, Math.min(100, installPercent))}%"></div>
+              {:else}
+                <div class="install-indet h-full w-1/3 rounded-full bg-brand-600"></div>
+              {/if}
+            </div>
+            <pre bind:this={installLogEl} class="max-h-24 min-h-10 overflow-y-auto whitespace-pre-wrap break-all rounded-lg border border-slate-100 bg-slate-50 p-2 font-mono text-[10px] leading-snug text-slate-600">{installLog.length ? installLog.join('\n') : 'Waiting for pip…'}</pre>
+          </div>
+        {:else if pythonBusy}
           <p class="flex items-center gap-2 px-1 text-xs font-medium text-brand-700" role="status">
             <span class="inline-block h-3.5 w-3.5 shrink-0 rounded-full border-2 border-brand-200 border-t-brand-600 animate-spin" aria-hidden="true"></span>
-            <span>{pythonBusyLabel === 'Installing…' ? 'Installing into this Python…' : pythonBusyLabel === 'Checking…' ? 'Checking this Python…' : 'Starting your Python…'}</span>
+            <span>{pythonStatusText()}</span>
           </p>
         {/if}
         {#if pythonNote}
           <p class="px-1 text-xs text-slate-500 break-all">{pythonNote}</p>
         {/if}
       </div>
-
-      <div class="grid grid-cols-2 gap-2">
-        <button type="button" class="px-3 py-2 rounded-lg text-xs font-medium border border-slate-200 text-slate-600 hover:bg-slate-50" onclick={() => checkHealth(false)}>Check health</button>
-        <button type="button" class="px-3 py-2 rounded-lg text-xs font-medium border border-slate-200 text-slate-600 hover:bg-slate-50" onclick={() => checkHealth(true)}>Warmup model</button>
-      </div>
     </div>
-
-    {#if health}
-      <p class="text-xs text-slate-600 rounded-xl bg-slate-50 border border-slate-200 p-3">
-        {health.status} · {health.model} · loaded={String(health.model_loaded)} · {health.device}
-      </p>
-    {/if}
     {#if fileNote}
       <p class="text-xs text-emerald-800 rounded-xl bg-emerald-50 border border-emerald-200 p-3">{fileNote}</p>
     {/if}
@@ -878,7 +969,10 @@
 {#if pythonBusy}
   <div class="fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-full border border-brand-200 bg-white px-4 py-2 text-sm font-semibold text-brand-700 shadow-lg" role="status">
     <span class="inline-block h-4 w-4 shrink-0 rounded-full border-2 border-brand-200 border-t-brand-600 animate-spin" aria-hidden="true"></span>
-    <span>{pythonBusyLabel === 'Installing…' ? 'Installing into this Python…' : pythonBusyLabel === 'Checking…' ? 'Checking this Python…' : 'Starting your Python…'}</span>
+    <span class="max-w-[16rem] truncate">{pythonStatusText()}</span>
+    {#if installing}
+      <button type="button" class="shrink-0 rounded-full border border-red-200 px-2.5 py-1 text-xs font-semibold text-red-600 hover:bg-red-50 disabled:opacity-50" onclick={cancelRunningInstall} disabled={installCancelling}>{installCancelling ? 'Cancelling…' : 'Cancel'}</button>
+    {/if}
   </div>
 {/if}
 
@@ -893,9 +987,19 @@
       </ul>
       <p class="mt-3 break-all text-xs text-slate-500">{installPrompt.python}</p>
       <div class="mt-5 flex justify-end gap-2">
-        <button type="button" class="rounded-lg border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50" onclick={cancelInstall}>Cancel</button>
+        <button type="button" class="rounded-lg border border-red-200 px-4 py-2 text-sm font-semibold text-red-600 hover:bg-red-50" onclick={cancelInstall}>Cancel</button>
         <button type="button" class="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700" onclick={confirmInstall}>Install</button>
       </div>
     </div>
   </div>
 {/if}
+
+<style>
+  .install-indet {
+    animation: install-indet 1.1s ease-in-out infinite;
+  }
+  @keyframes install-indet {
+    0% { transform: translateX(-120%); }
+    100% { transform: translateX(400%); }
+  }
+</style>

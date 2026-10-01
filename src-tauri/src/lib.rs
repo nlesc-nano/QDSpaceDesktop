@@ -33,7 +33,7 @@ struct Probe {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
-    .invoke_handler(tauri::generate_handler![pick_python_path, check_user_python, apply_user_python])
+    .invoke_handler(tauri::generate_handler![pick_python_path, check_user_python, apply_user_python, cancel_python_install, python_install_status])
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -201,12 +201,30 @@ fn restart_default_sidecar(app: &tauri::AppHandle) {
   }
 }
 
+/// Repo sidecar next to src-tauri. Only debug builds (`tauri dev`) may use it.
+/// A release installer must not fall back to a source tree on the machine.
+fn dev_repo_sidecar() -> Option<std::path::PathBuf> {
+  #[cfg(debug_assertions)]
+  {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sidecar");
+    if dir.join("sidecar_app.py").is_file() {
+      return Some(std::fs::canonicalize(&dir).unwrap_or(dir));
+    }
+  }
+  None
+}
+
 fn sidecar_workdir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
   if let Some(root) = project_root() {
     let dir = root.join("sidecar");
     if dir.join("sidecar_app.py").is_file() {
       return Ok(dir);
     }
+  }
+  // User Python does not need the packed mace-runtime. In `tauri dev` the
+  // selected interpreter runs the repo sidecar (cwd / PYTHONPATH).
+  if let Some(dir) = dev_repo_sidecar() {
+    return Ok(dir);
   }
   if let Some(runtime) = bundled_runtime(app) {
     let dir = runtime.join("app");
@@ -297,7 +315,232 @@ fn with_python_env(cmd: &mut std::process::Command, python: &std::path::Path) {
   cmd.env("PYTHONIOENCODING", "utf-8");
 }
 
-fn run_python(python: &std::path::Path, args: &[String]) -> Result<std::process::Output, String> {
+const INSTALL_CANCELLED: &str = "Install cancelled.";
+
+struct InstallCtrl {
+  running: bool,
+  cancel: bool,
+  pid: Option<u32>,
+  package: String,
+  percent: Option<u8>,
+  lines: Vec<String>,
+}
+
+static INSTALL: std::sync::Mutex<InstallCtrl> = std::sync::Mutex::new(InstallCtrl {
+  running: false,
+  cancel: false,
+  pid: None,
+  package: String::new(),
+  percent: None,
+  lines: Vec::new(),
+});
+
+fn install_lock() -> std::sync::MutexGuard<'static, InstallCtrl> {
+  INSTALL.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn begin_install_session() {
+  let mut gate = install_lock();
+  gate.running = true;
+  gate.cancel = false;
+  gate.pid = None;
+  gate.package.clear();
+  gate.percent = None;
+  gate.lines.clear();
+}
+
+fn end_install_session() {
+  let mut gate = install_lock();
+  gate.running = false;
+  gate.cancel = false;
+  gate.pid = None;
+}
+
+fn install_running() -> bool {
+  install_lock().running
+}
+
+fn install_cancelled() -> bool {
+  install_lock().cancel
+}
+
+fn remember_install_pid(pid: u32) -> bool {
+  let mut gate = install_lock();
+  if gate.cancel || !gate.running {
+    return false;
+  }
+  gate.pid = Some(pid);
+  true
+}
+
+fn forget_install_pid(pid: u32) {
+  let mut gate = install_lock();
+  if gate.pid == Some(pid) {
+    gate.pid = None;
+  }
+}
+
+fn kill_install_pid(pid: u32) {
+  #[cfg(windows)]
+  {
+    kill_pid(pid);
+  }
+  #[cfg(not(windows))]
+  {
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args(["-9", &pid.to_string()]);
+    hidden(&mut cmd);
+    let _ = cmd.output();
+  }
+}
+
+fn force_stop_child(child: &mut std::process::Child) {
+  let pid = child.id();
+  forget_install_pid(pid);
+  kill_install_pid(pid);
+  let _ = child.kill();
+  let _ = child.wait();
+}
+
+fn set_install_label(label: &str) {
+  let label = label.trim();
+  if label.is_empty() {
+    return;
+  }
+  let mut gate = install_lock();
+  if !gate.running {
+    return;
+  }
+  gate.package = clip_chars(label, 80);
+  gate.percent = None;
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+  if text.chars().count() <= max {
+    return text.to_string();
+  }
+  let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+  out.push('…');
+  out
+}
+
+fn strip_ansi(input: &str) -> String {
+  let mut out = String::with_capacity(input.len());
+  let mut chars = input.chars().peekable();
+  while let Some(ch) = chars.next() {
+    if ch == '\u{1b}' {
+      if chars.peek() == Some(&'[') {
+        chars.next();
+        for next in chars.by_ref() {
+          if next.is_ascii_alphabetic() {
+            break;
+          }
+        }
+      }
+      continue;
+    }
+    out.push(ch);
+  }
+  out
+}
+
+fn visible_pip_line(raw: &str) -> String {
+  let stripped = strip_ansi(raw);
+  stripped
+    .split(['\r', '\n'])
+    .map(str::trim)
+    .filter(|part| !part.is_empty())
+    .next_back()
+    .unwrap_or("")
+    .to_string()
+}
+
+fn parse_progress(line: &str) -> Option<(u64, u64)> {
+  let rest = line.strip_prefix("Progress ")?;
+  let (current, total) = rest.split_once(" of ")?;
+  let current = current.trim().parse::<u64>().ok()?;
+  let total = total.trim().parse::<u64>().ok()?;
+  Some((current, total))
+}
+
+fn collecting_name(line: &str) -> Option<String> {
+  let rest = line.strip_prefix("Collecting ")?;
+  let name = rest
+    .split(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ';' | '['))
+    .next()
+    .unwrap_or("")
+    .trim();
+  if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+fn installing_names(line: &str) -> Option<String> {
+  let rest = line.strip_prefix("Installing collected packages:")?;
+  let names: Vec<&str> = rest.split(',').map(str::trim).filter(|name| !name.is_empty()).collect();
+  if names.is_empty() { None } else { Some(names.join(", ")) }
+}
+
+fn observe_pip_line(raw: &str) {
+  let line = visible_pip_line(raw);
+  if line.is_empty() {
+    return;
+  }
+  let mut gate = install_lock();
+  if !gate.running {
+    return;
+  }
+  if let Some((current, total)) = parse_progress(&line) {
+    if total > 0 {
+      let percent = ((current.saturating_mul(100)) / total).min(100) as u8;
+      gate.percent = Some(percent);
+    }
+    return;
+  }
+  if let Some(name) = collecting_name(&line) {
+    gate.package = clip_chars(&name, 80);
+    gate.percent = None;
+  } else if let Some(name) = installing_names(&line) {
+    gate.package = clip_chars(&name, 80);
+    gate.percent = None;
+  }
+  if gate.lines.len() >= 80 {
+    gate.lines.remove(0);
+  }
+  gate.lines.push(clip_chars(&line, 220));
+}
+
+fn distribution_name(spec: &str) -> &str {
+  spec
+    .split(['=', '>', '<', '!', '~', '[', ' ', ';'])
+    .next()
+    .unwrap_or(spec)
+    .trim()
+}
+
+fn read_pipe_lines<R: std::io::Read>(reader: R, is_err: bool, tx: std::sync::mpsc::Sender<(bool, String)>) {
+  let mut reader = std::io::BufReader::new(reader);
+  let mut buf = String::new();
+  loop {
+    buf.clear();
+    match std::io::BufRead::read_line(&mut reader, &mut buf) {
+      Ok(0) => break,
+      Ok(_) => {
+        if tx.send((is_err, buf.clone())).is_err() {
+          break;
+        }
+      }
+      Err(_) => break,
+    }
+  }
+}
+
+fn append_captured_line(buf: &mut Vec<u8>, line: &str) {
+  if buf.len() > 64_000 {
+    return;
+  }
+  buf.extend_from_slice(line.as_bytes());
+}
+
+fn run_python_blocking(python: &std::path::Path, args: &[String]) -> Result<std::process::Output, String> {
   let mut cmd = std::process::Command::new(python);
   cmd
     .args(args)
@@ -307,6 +550,95 @@ fn run_python(python: &std::path::Path, args: &[String]) -> Result<std::process:
   with_python_env(&mut cmd, python);
   hidden(&mut cmd);
   cmd.output().map_err(|err| format!("This Python did not run: {err}"))
+}
+
+fn run_python_tracked(python: &std::path::Path, args: &[String], pip_log: bool) -> Result<std::process::Output, String> {
+  if install_cancelled() {
+    return Err(INSTALL_CANCELLED.into());
+  }
+  let mut cmd = std::process::Command::new(python);
+  cmd
+    .args(args)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+  with_python_env(&mut cmd, python);
+  if pip_log {
+    cmd.env("PYTHONUNBUFFERED", "1");
+    cmd.env("PIP_PROGRESS_BAR", "raw");
+  }
+  hidden(&mut cmd);
+  let mut child = cmd.spawn().map_err(|err| format!("This Python did not run: {err}"))?;
+  if !remember_install_pid(child.id()) {
+    force_stop_child(&mut child);
+    return Err(INSTALL_CANCELLED.into());
+  }
+  let stdout = child.stdout.take().ok_or_else(|| "This Python did not run: no stdout".to_string())?;
+  let stderr = child.stderr.take().ok_or_else(|| "This Python did not run: no stderr".to_string())?;
+  let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+  let tx_err = tx.clone();
+  let out_thread = std::thread::spawn(move || read_pipe_lines(stdout, false, tx));
+  let err_thread = std::thread::spawn(move || read_pipe_lines(stderr, true, tx_err));
+
+  let mut out_buf = Vec::new();
+  let mut err_buf = Vec::new();
+  let status = loop {
+    if install_cancelled() {
+      force_stop_child(&mut child);
+      let _ = out_thread.join();
+      let _ = err_thread.join();
+      return Err(INSTALL_CANCELLED.into());
+    }
+    match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+      Ok((is_err, line)) => {
+        append_captured_line(if is_err { &mut err_buf } else { &mut out_buf }, &line);
+        if pip_log {
+          observe_pip_line(&line);
+        }
+      }
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match child.try_wait() {
+        Ok(Some(status)) => break status,
+        Ok(None) => {}
+        Err(err) => {
+          forget_install_pid(child.id());
+          let _ = out_thread.join();
+          let _ = err_thread.join();
+          return Err(format!("Could not check the installer: {err}"));
+        }
+      },
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        break child.wait().map_err(|err| {
+          forget_install_pid(child.id());
+          format!("Could not check the installer: {err}")
+        })?;
+      }
+    }
+  };
+  forget_install_pid(child.id());
+  let _ = out_thread.join();
+  let _ = err_thread.join();
+  while let Ok((is_err, line)) = rx.try_recv() {
+    append_captured_line(if is_err { &mut err_buf } else { &mut out_buf }, &line);
+    if pip_log {
+      observe_pip_line(&line);
+    }
+  }
+  if install_cancelled() {
+    return Err(INSTALL_CANCELLED.into());
+  }
+  Ok(std::process::Output {
+    status,
+    stdout: out_buf,
+    stderr: err_buf,
+  })
+}
+
+fn run_python(python: &std::path::Path, args: &[String]) -> Result<std::process::Output, String> {
+  if install_running() {
+    run_python_tracked(python, args, false)
+  } else {
+    run_python_blocking(python, args)
+  }
 }
 
 fn output_text(bytes: &[u8]) -> String {
@@ -411,14 +743,25 @@ fn assert_not_torch(spec: &str) -> Result<(), String> {
   Ok(())
 }
 
+fn pip_refused_progress_bar(output: &std::process::Output) -> bool {
+  let mut detail = String::from_utf8_lossy(&output.stderr).to_string();
+  detail.push_str(&String::from_utf8_lossy(&output.stdout));
+  let detail = detail.to_lowercase();
+  detail.contains("progress-bar")
+    && (detail.contains("no such option") || detail.contains("unrecognized arguments") || detail.contains("unrecognized option"))
+}
+
 fn pip_install(python: &std::path::Path, specs: &[String], no_deps: bool) -> Result<(), String> {
+  if install_cancelled() {
+    return Err(INSTALL_CANCELLED.into());
+  }
   if specs.is_empty() {
     return Ok(());
   }
   for spec in specs {
     assert_not_torch(spec)?;
   }
-  let run = |specs: &[String], no_deps: bool| -> Result<std::process::Output, String> {
+  let run = |specs: &[String], no_deps: bool, progress_bar: bool| -> Result<std::process::Output, String> {
     let mut args = vec![
       "-m".into(),
       "pip".into(),
@@ -428,16 +771,47 @@ fn pip_install(python: &std::path::Path, specs: &[String], no_deps: bool) -> Res
       "--upgrade-strategy".into(),
       "only-if-needed".into(),
     ];
+    if progress_bar {
+      // "raw" prints "Progress <bytes> of <total>" even when pip is not attached to a terminal.
+      args.push("--progress-bar".into());
+      args.push("raw".into());
+    }
     if no_deps {
       // mace-torch depends on torch. --no-deps installs MACE without fetching or upgrading torch.
       args.push("--no-deps".into());
     }
     args.extend(specs.iter().cloned());
-    run_python(python, &args)
+    let label = specs
+      .iter()
+      .map(|spec| distribution_name(spec))
+      .filter(|name| !name.is_empty())
+      .collect::<Vec<_>>()
+      .join(", ");
+    if !label.is_empty() {
+      set_install_label(&label);
+    }
+    if install_running() {
+      run_python_tracked(python, &args, true)
+    } else {
+      run_python_blocking(python, &args)
+    }
   };
-  let output = run(specs, no_deps)?;
+  let output = run(specs, no_deps, true)?;
+  if !output.status.success() && pip_refused_progress_bar(&output) {
+    let output = run(specs, no_deps, false)?;
+    if output.status.success() {
+      return Ok(());
+    }
+    if install_cancelled() {
+      return Err(INSTALL_CANCELLED.into());
+    }
+    return Err(command_error("pip install failed. Torch was not changed.", &output));
+  }
   if output.status.success() {
     return Ok(());
+  }
+  if install_cancelled() {
+    return Err(INSTALL_CANCELLED.into());
   }
   if specs.iter().any(|spec| spec.contains("uvicorn[standard]")) {
     let plain: Vec<String> = specs
@@ -450,9 +824,12 @@ fn pip_install(python: &std::path::Path, specs: &[String], no_deps: bool) -> Res
         }
       })
       .collect();
-    let retry = run(&plain, no_deps)?;
+    let retry = run(&plain, no_deps, true)?;
     if retry.status.success() {
       return Ok(());
+    }
+    if install_cancelled() {
+      return Err(INSTALL_CANCELLED.into());
     }
     return Err(command_error("pip install failed. Torch was not changed.", &retry));
   }
@@ -515,6 +892,9 @@ sys.exit(0)
     seen.push(module.clone());
     let package = map_distribution(&module);
     assert_not_torch(&package)?;
+    if install_cancelled() {
+      return Err(INSTALL_CANCELLED.into());
+    }
     pip_install(python, &[package], true)?;
   }
   Err("mace-torch still has missing dependencies. Torch was not changed.".into())
@@ -572,6 +952,9 @@ fn check_user_python_impl(app: &tauri::AppHandle, python_path: &str) -> Result<P
 /// Installs only names the user confirmed that are still missing. Never installs torch.
 /// Returns whether mace-torch was installed by this call, plus a fresh probe.
 fn install_confirmed(python: &std::path::Path, requested: &[String]) -> Result<(Probe, bool), String> {
+  if install_cancelled() {
+    return Err(INSTALL_CANCELLED.into());
+  }
   let first = probe_python(python)?;
   let before = first.torch.clone().unwrap_or_default();
   if before.is_empty() {
@@ -605,12 +988,24 @@ fn install_confirmed(python: &std::path::Path, requested: &[String]) -> Result<(
   }
 
   if !specs.is_empty() {
+    if install_cancelled() {
+      return Err(INSTALL_CANCELLED.into());
+    }
     pip_install(python, &specs, false)?;
   }
   if install_mace {
+    if install_cancelled() {
+      return Err(INSTALL_CANCELLED.into());
+    }
     // Package name from sidecar/requirements.txt. --no-deps keeps the env's torch.
     pip_install(python, &["mace-torch>=0.3.14".into()], true)?;
+    if install_cancelled() {
+      return Err(INSTALL_CANCELLED.into());
+    }
     fill_mace_deps(python)?;
+  }
+  if install_cancelled() {
+    return Err(INSTALL_CANCELLED.into());
   }
 
   let probe = if specs.is_empty() && !install_mace { first } else { probe_python(python)? };
@@ -799,6 +1194,15 @@ fn start_user_sidecar(python: &std::path::Path, cwd: &std::path::Path) -> Result
     .stdout(std::process::Stdio::from(stdout))
     .stderr(std::process::Stdio::from(log_file));
   with_python_env(&mut cmd, python);
+  let sidecar_dir = cwd.to_string_lossy().to_string();
+  let pythonpath = match std::env::var("PYTHONPATH") {
+    Ok(old) if !old.trim().is_empty() => {
+      let sep = if cfg!(windows) { ";" } else { ":" };
+      format!("{sidecar_dir}{sep}{old}")
+    }
+    _ => sidecar_dir,
+  };
+  cmd.env("PYTHONPATH", pythonpath);
   hidden(&mut cmd);
   let mut child = cmd.spawn().map_err(|err| format!("Could not start the sidecar with this Python: {err}"))?;
   for _ in 0..180 {
@@ -932,14 +1336,64 @@ async fn check_user_python(app: tauri::AppHandle, python_path: String) -> Result
   off_ui_thread(move || check_user_python_impl(&app, &python_path)).await
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PythonInstallStatus {
+  running: bool,
+  package: String,
+  percent: Option<u8>,
+  lines: Vec<String>,
+}
+
+/// Stop the pip process for the install that is running. Does not start the sidecar.
+#[tauri::command]
+fn cancel_python_install() -> Result<(), String> {
+  let pid = {
+    let mut gate = install_lock();
+    gate.cancel = true;
+    gate.pid.take()
+  };
+  if let Some(pid) = pid {
+    kill_install_pid(pid);
+  }
+  Ok(())
+}
+
+/// Latest pip progress. Percent is set only when pip reports bytes downloaded out of a known total.
+#[tauri::command]
+fn python_install_status() -> PythonInstallStatus {
+  let gate = install_lock();
+  PythonInstallStatus {
+    running: gate.running,
+    package: gate.package.clone(),
+    percent: gate.percent,
+    lines: gate.lines.clone(),
+  }
+}
+
 /// Install only the confirmed missing libraries into this interpreter, then start the sidecar on port 8765.
 /// An empty list installs nothing and only switches the sidecar when the check already passed.
+/// Cancelled installs return before the sidecar is switched.
 #[tauri::command]
 async fn apply_user_python(app: tauri::AppHandle, python_path: String, packages: Vec<String>) -> Result<UserPythonInfo, String> {
-  off_ui_thread(move || {
+  let installing = !packages.is_empty();
+  if installing {
+    begin_install_session();
+  }
+  let outcome = off_ui_thread(move || {
+    if installing && install_cancelled() {
+      return Err(INSTALL_CANCELLED.into());
+    }
     let (python_path, python) = validate_user_python(&app, &python_path)?;
     let (probe, installed_mace) = install_confirmed(&python, &packages)?;
+    if installing && install_cancelled() {
+      return Err(INSTALL_CANCELLED.into());
+    }
     switch_user_sidecar(&app, &python, python_path, &probe, installed_mace)
   })
-  .await
+  .await;
+  if installing {
+    end_install_session();
+  }
+  outcome
 }
