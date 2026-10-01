@@ -1,8 +1,39 @@
 use tauri::Manager;
 
+const SIDECAR_PORT: u16 = 8765;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserPythonInfo {
+  python: String,
+  device: String,
+  torch: String,
+  installed_mace: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PythonCheck {
+  python: String,
+  device: String,
+  torch: String,
+  missing: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct Probe {
+  torch: Option<String>,
+  cuda: bool,
+  mps: bool,
+  missing: Vec<String>,
+  pins: std::collections::BTreeMap<String, String>,
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    .invoke_handler(tauri::generate_handler![pick_python_path, check_user_python, apply_user_python])
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -80,6 +111,16 @@ fn bundled_runtime(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
   }
 }
 
+fn developer_sidecar_python() -> std::path::PathBuf {
+  std::env::var("USERPROFILE")
+    .map(std::path::PathBuf::from)
+    .unwrap_or_default()
+    .join(".conda")
+    .join("envs")
+    .join("webappdesktop")
+    .join("python.exe")
+}
+
 fn spawn_uvicorn(python: &std::path::Path, cwd: &std::path::Path) {
   let mut cmd = std::process::Command::new(python);
   cmd
@@ -98,14 +139,8 @@ fn spawn_uvicorn(python: &std::path::Path, cwd: &std::path::Path) {
 }
 
 fn start_developer_services(root: &std::path::Path) {
-  if !listening(8765) {
-    let python = std::env::var("USERPROFILE")
-      .map(std::path::PathBuf::from)
-      .unwrap_or_default()
-      .join(".conda")
-      .join("envs")
-      .join("webappdesktop")
-      .join("python.exe");
+  if !listening(SIDECAR_PORT) {
+    let python = developer_sidecar_python();
     if python.is_file() {
       spawn_uvicorn(&python, &root.join("sidecar"));
     } else {
@@ -138,7 +173,7 @@ fn start_local_services(app: &tauri::AppHandle) {
     return;
   }
 
-  if listening(8765) {
+  if listening(SIDECAR_PORT) {
     return;
   }
   if let Some(runtime) = bundled_runtime(app) {
@@ -146,4 +181,765 @@ fn start_local_services(app: &tauri::AppHandle) {
       spawn_uvicorn(&python, &runtime.join("app"));
     }
   }
+}
+
+fn restart_default_sidecar(app: &tauri::AppHandle) {
+  if listening(SIDECAR_PORT) {
+    return;
+  }
+  if let Some(root) = project_root() {
+    let python = developer_sidecar_python();
+    if python.is_file() {
+      spawn_uvicorn(&python, &root.join("sidecar"));
+      return;
+    }
+  }
+  if let Some(runtime) = bundled_runtime(app) {
+    if let Some(python) = bundled_python(&runtime) {
+      spawn_uvicorn(&python, &runtime.join("app"));
+    }
+  }
+}
+
+fn sidecar_workdir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+  if let Some(root) = project_root() {
+    let dir = root.join("sidecar");
+    if dir.join("sidecar_app.py").is_file() {
+      return Ok(dir);
+    }
+  }
+  if let Some(runtime) = bundled_runtime(app) {
+    let dir = runtime.join("app");
+    if dir.join("sidecar_app.py").is_file() {
+      return Ok(dir);
+    }
+  }
+  Err("The Predict sidecar files are not in this install.".into())
+}
+
+fn clean_python_path(raw: &str) -> String {
+  raw.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string()
+}
+
+fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+  if left == right {
+    return true;
+  }
+  match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+    (Ok(a), Ok(b)) => a == b,
+    _ => false,
+  }
+}
+
+
+fn looks_like_bundled_runtime(python: &std::path::Path) -> bool {
+  python.components().any(|component| component.as_os_str().to_string_lossy().eq_ignore_ascii_case("mace-runtime"))
+}
+
+fn is_bundled_python(app: &tauri::AppHandle, python: &std::path::Path) -> bool {
+  let Some(runtime) = bundled_runtime(app) else {
+    return false;
+  };
+  if let Some(bundled) = bundled_python(&runtime) {
+    if same_path(python, &bundled) {
+      return true;
+    }
+  }
+  let python = std::fs::canonicalize(python).unwrap_or_else(|_| python.to_path_buf());
+  let runtime = std::fs::canonicalize(&runtime).unwrap_or(runtime);
+  python.starts_with(&runtime)
+}
+
+fn env_root_for(python: &std::path::Path) -> std::path::PathBuf {
+  let Some(parent) = python.parent() else {
+    return python.to_path_buf();
+  };
+  match parent.file_name().and_then(|name| name.to_str()) {
+    Some("bin") | Some("Scripts") => parent.parent().unwrap_or(parent).to_path_buf(),
+    _ => parent.to_path_buf(),
+  }
+}
+
+fn augmented_path(python: &std::path::Path) -> String {
+  let root = env_root_for(python);
+  let mut dirs = Vec::new();
+  if let Some(parent) = python.parent() {
+    dirs.push(parent.to_path_buf());
+  }
+  dirs.push(root.clone());
+  dirs.push(root.join("Library").join("bin"));
+  dirs.push(root.join("Library").join("usr").join("bin"));
+  dirs.push(root.join("Scripts"));
+  dirs.push(root.join("bin"));
+  dirs.push(root.join("Lib").join("site-packages").join("torch").join("lib"));
+  let mut parts = Vec::new();
+  for dir in dirs {
+    if !dir.is_dir() {
+      continue;
+    }
+    let text = dir.to_string_lossy().to_string();
+    if !parts.iter().any(|existing: &String| existing == &text) {
+      parts.push(text);
+    }
+  }
+  if let Ok(old) = std::env::var("PATH") {
+    if !old.is_empty() {
+      parts.push(old);
+    }
+  }
+  let sep = if cfg!(windows) { ";" } else { ":" };
+  parts.join(sep)
+}
+
+fn with_python_env(cmd: &mut std::process::Command, python: &std::path::Path) {
+  cmd.env("PATH", augmented_path(python));
+  cmd.env("PYTHONUTF8", "1");
+  cmd.env("PYTHONIOENCODING", "utf-8");
+}
+
+fn run_python(python: &std::path::Path, args: &[String]) -> Result<std::process::Output, String> {
+  let mut cmd = std::process::Command::new(python);
+  cmd
+    .args(args)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+  with_python_env(&mut cmd, python);
+  hidden(&mut cmd);
+  cmd.output().map_err(|err| format!("This Python did not run: {err}"))
+}
+
+fn output_text(bytes: &[u8]) -> String {
+  String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+fn text_tail(text: &str, max: usize) -> String {
+  let text = text.trim();
+  if text.len() <= max {
+    return text.to_string();
+  }
+  let mut start = text.len() - max;
+  while start < text.len() && !text.is_char_boundary(start) {
+    start += 1;
+  }
+  text[start..].trim().to_string()
+}
+
+fn command_error(prefix: &str, output: &std::process::Output) -> String {
+  let mut detail = output_text(&output.stderr);
+  if detail.is_empty() {
+    detail = output_text(&output.stdout);
+  }
+  if detail.is_empty() {
+    detail = format!("exit {}", output.status);
+  }
+  format!("{prefix} {}", text_tail(&detail, 1200))
+}
+
+const PROBE: &str = r#"
+import json, sys
+out = {"torch": None, "cuda": False, "mps": False, "missing": [], "pins": {}}
+try:
+    import torch
+except Exception as exc:
+    sys.stderr.write(
+        "PyTorch is not installed in this Python (%s). Install GPU PyTorch in the conda env first. This app will not install or upgrade torch.\n" % exc
+    )
+    sys.exit(2)
+out["torch"] = getattr(torch, "__version__", "")
+out["pins"]["torch"] = out["torch"]
+try:
+    out["cuda"] = bool(torch.cuda.is_available())
+except Exception:
+    out["cuda"] = False
+try:
+    mps = getattr(getattr(torch, "backends", None), "mps", None)
+    out["mps"] = bool(mps is not None and mps.is_available())
+except Exception:
+    out["mps"] = False
+for name in ("torchvision", "torchaudio"):
+    try:
+        mod = __import__(name)
+        version = getattr(mod, "__version__", None)
+        if version:
+            out["pins"][name] = version
+    except Exception:
+        pass
+for name in ("mace", "fastapi", "uvicorn", "pydantic", "numpy", "ase"):
+    try:
+        __import__(name)
+    except Exception:
+        out["missing"].append(name)
+sys.stdout.write(json.dumps(out) + "\n")
+"#;
+
+fn probe_python(python: &std::path::Path) -> Result<Probe, String> {
+  let output = run_python(python, &["-c".into(), PROBE.into()])?;
+  if !output.status.success() {
+    let err = command_error("This Python failed the PyTorch check.", &output);
+    if output.status.code() == Some(2) {
+      return Err(err);
+    }
+    return Err(err);
+  }
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let line = stdout.lines().rev().find(|line| line.trim_start().starts_with('{')).unwrap_or("");
+  if line.is_empty() {
+    return Err("This Python did not report its PyTorch status.".into());
+  }
+  serde_json::from_str(line).map_err(|err| format!("This Python returned an unreadable status: {err}"))
+}
+
+fn pip_spec(import_name: &str) -> Option<&'static str> {
+  // Same packages and floors as sidecar/requirements.txt. Never torch.
+  match import_name {
+    "mace" => Some("mace-torch>=0.3.14"),
+    "fastapi" => Some("fastapi>=0.110"),
+    "uvicorn" => Some("uvicorn[standard]>=0.27"),
+    "pydantic" => Some("pydantic>=2"),
+    "numpy" => Some("numpy>=1.26"),
+    "ase" => Some("ase>=3.22"),
+    _ => None,
+  }
+}
+
+fn assert_not_torch(spec: &str) -> Result<(), String> {
+  let name = spec.split(['=', '>', '<', '[', ' ']).next().unwrap_or(spec);
+  if name == "torch" || name == "torchvision" || name == "torchaudio" {
+    return Err("Refusing to install or upgrade torch.".into());
+  }
+  Ok(())
+}
+
+fn pip_install(python: &std::path::Path, specs: &[String], no_deps: bool) -> Result<(), String> {
+  if specs.is_empty() {
+    return Ok(());
+  }
+  for spec in specs {
+    assert_not_torch(spec)?;
+  }
+  let run = |specs: &[String], no_deps: bool| -> Result<std::process::Output, String> {
+    let mut args = vec![
+      "-m".into(),
+      "pip".into(),
+      "install".into(),
+      "--disable-pip-version-check".into(),
+      "--no-input".into(),
+      "--upgrade-strategy".into(),
+      "only-if-needed".into(),
+    ];
+    if no_deps {
+      // mace-torch depends on torch. --no-deps installs MACE without fetching or upgrading torch.
+      args.push("--no-deps".into());
+    }
+    args.extend(specs.iter().cloned());
+    run_python(python, &args)
+  };
+  let output = run(specs, no_deps)?;
+  if output.status.success() {
+    return Ok(());
+  }
+  if specs.iter().any(|spec| spec.contains("uvicorn[standard]")) {
+    let plain: Vec<String> = specs
+      .iter()
+      .map(|spec| {
+        if spec.contains("uvicorn[standard]") {
+          "uvicorn>=0.27".into()
+        } else {
+          spec.clone()
+        }
+      })
+      .collect();
+    let retry = run(&plain, no_deps)?;
+    if retry.status.success() {
+      return Ok(());
+    }
+    return Err(command_error("pip install failed. Torch was not changed.", &retry));
+  }
+  Err(command_error("pip install failed. Torch was not changed.", &output))
+}
+
+fn map_distribution(module: &str) -> String {
+  match module {
+    "yaml" => "pyyaml".into(),
+    "git" => "GitPython".into(),
+    "cv2" => "opencv-python".into(),
+    "sklearn" => "scikit-learn".into(),
+    "torch_ema" => "torch-ema".into(),
+    other => other.to_string(),
+  }
+}
+
+fn fill_mace_deps(python: &std::path::Path) -> Result<(), String> {
+  let script = r#"
+import sys
+try:
+    import mace
+    from mace.calculators import MACECalculator
+except ModuleNotFoundError as exc:
+    name = (getattr(exc, "name", None) or "").split(".")[0]
+    sys.stdout.write(name)
+    sys.exit(3)
+except Exception as exc:
+    sys.stderr.write(str(exc))
+    sys.exit(4)
+sys.exit(0)
+"#;
+  let mut seen: Vec<String> = Vec::new();
+  for _ in 0..15 {
+    let output = run_python(python, &["-c".into(), script.into()])?;
+    if output.status.success() {
+      return Ok(());
+    }
+    if output.status.code() != Some(3) {
+      return Err(command_error("mace-torch did not import. Torch was not changed.", &output));
+    }
+    // Import-time warnings may be printed before the missing module name.
+    // The probe writes the name last, so only use the last non-empty stdout line.
+    let module = String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .rev()
+      .map(str::trim)
+      .find(|line| !line.is_empty())
+      .unwrap_or("")
+      .to_string();
+    if module == "mace" || module == "torch" || module == "torchvision" || module == "torchaudio" {
+      return Err("mace-torch did not import, and this app will not install or upgrade torch. Torch was not changed.".into());
+    }
+    if module.is_empty() || !module.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+      return Err("mace-torch is missing a dependency whose name could not be installed. Torch was not changed.".into());
+    }
+    if seen.iter().any(|item| item == &module) {
+      return Err(format!("pip could not provide {module} for mace-torch. Torch was not changed."));
+    }
+    seen.push(module.clone());
+    let package = map_distribution(&module);
+    assert_not_torch(&package)?;
+    pip_install(python, &[package], true)?;
+  }
+  Err("mace-torch still has missing dependencies. Torch was not changed.".into())
+}
+
+fn required_missing(probe: &Probe) -> Vec<String> {
+  probe
+    .missing
+    .iter()
+    .filter(|name| pip_spec(name).is_some())
+    .cloned()
+    .collect()
+}
+
+fn validate_user_python(app: &tauri::AppHandle, python_path: &str) -> Result<(String, std::path::PathBuf), String> {
+  let python_path = clean_python_path(python_path);
+  if python_path.is_empty() {
+    return Err("Choose python.exe inside the conda env, for example C:\\Users\\...\\anaconda3\\envs\\qdspace-user\\python.exe.".into());
+  }
+  let python = std::path::PathBuf::from(&python_path);
+  if !python.is_file() {
+    return Err(format!(
+      "Python was not found at {}. Choose python.exe inside the conda env.",
+      python.display()
+    ));
+  }
+  if python.file_name().and_then(|name| name.to_str()).unwrap_or("").eq_ignore_ascii_case("pythonw.exe") {
+    return Err("Choose python.exe, not pythonw.exe.".into());
+  }
+  if is_bundled_python(app, &python) || looks_like_bundled_runtime(&python) {
+    return Err("That is the built-in CPU runtime. Choose python.exe from your conda env instead.".into());
+  }
+  let check = run_python(&python, &["-c".into(), "import sys; print(sys.executable)".into()])?;
+  if !check.status.success() {
+    return Err(command_error("This Python did not run.", &check));
+  }
+  Ok((python_path, python))
+}
+
+fn check_user_python_impl(app: &tauri::AppHandle, python_path: &str) -> Result<PythonCheck, String> {
+  let (python_path, python) = validate_user_python(app, python_path)?;
+  let probe = probe_python(&python)?;
+  let torch = probe.torch.clone().unwrap_or_default();
+  if torch.is_empty() {
+    return Err("PyTorch is not installed in this Python. Install GPU PyTorch in the conda env first. This app will not install or upgrade torch.".into());
+  }
+  Ok(PythonCheck {
+    python: python_path,
+    device: device_label(&probe).into(),
+    torch,
+    missing: required_missing(&probe),
+  })
+}
+
+/// Installs only names the user confirmed that are still missing. Never installs torch.
+/// Returns whether mace-torch was installed by this call, plus a fresh probe.
+fn install_confirmed(python: &std::path::Path, requested: &[String]) -> Result<(Probe, bool), String> {
+  let first = probe_python(python)?;
+  let before = first.torch.clone().unwrap_or_default();
+  if before.is_empty() {
+    return Err("PyTorch is not installed in this Python. Install GPU PyTorch in the conda env first. This app will not install or upgrade torch.".into());
+  }
+
+  let mut seen = std::collections::BTreeSet::new();
+  let mut specs: Vec<String> = Vec::new();
+  let mut install_mace = false;
+  for name in requested {
+    let name = name.trim();
+    if name.is_empty() || !seen.insert(name.to_string()) {
+      continue;
+    }
+    if name == "torch" || name == "torchvision" || name == "torchaudio" {
+      return Err("Refusing to install or upgrade torch.".into());
+    }
+    if pip_spec(name).is_none() {
+      return Err(format!("This app will not install {name}."));
+    }
+    if !first.missing.iter().any(|missing| missing == name) {
+      continue;
+    }
+    if name == "mace" {
+      install_mace = true;
+      continue;
+    }
+    let spec = pip_spec(name).unwrap();
+    assert_not_torch(spec)?;
+    specs.push(spec.to_string());
+  }
+
+  if !specs.is_empty() {
+    pip_install(python, &specs, false)?;
+  }
+  if install_mace {
+    // Package name from sidecar/requirements.txt. --no-deps keeps the env's torch.
+    pip_install(python, &["mace-torch>=0.3.14".into()], true)?;
+    fill_mace_deps(python)?;
+  }
+
+  let probe = if specs.is_empty() && !install_mace { first } else { probe_python(python)? };
+  let after = probe.torch.clone().unwrap_or_default();
+  if after != before {
+    return Err(format!(
+      "Torch changed from {before} to {after}. Predict was not switched to this Python."
+    ));
+  }
+  let still = required_missing(&probe);
+  if !still.is_empty() {
+    return Err(format!(
+      "This Python is still missing packages ({}). Torch was not changed.",
+      still.join(", ")
+    ));
+  }
+  Ok((probe, install_mace))
+}
+
+fn switch_user_sidecar(app: &tauri::AppHandle, python: &std::path::Path, python_path: String, probe: &Probe, installed_mace: bool) -> Result<UserPythonInfo, String> {
+  let torch = probe.torch.clone().unwrap_or_default();
+  let workdir = sidecar_workdir(app)?;
+  if let Err(err) = stop_port(SIDECAR_PORT) {
+    return Err(err);
+  }
+  if let Err(err) = start_user_sidecar(python, &workdir) {
+    restart_default_sidecar(app);
+    return Err(err);
+  }
+  Ok(UserPythonInfo {
+    python: python_path,
+    device: device_label(probe).into(),
+    torch,
+    installed_mace,
+  })
+}
+
+async fn off_ui_thread<T, F>(work: F) -> Result<T, String>
+where
+  T: Send + 'static,
+  F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+  match tauri::async_runtime::spawn_blocking(work).await {
+    Ok(result) => result,
+    Err(err) => Err(format!("The Python task stopped before it finished: {err}")),
+  }
+}
+
+fn push_pid(pids: &mut Vec<u32>, pid: u32) {
+  if pid > 4 && pid != std::process::id() && !pids.contains(&pid) {
+    pids.push(pid);
+  }
+}
+
+fn parse_pids(bytes: &[u8]) -> Vec<u32> {
+  let mut pids = Vec::new();
+  for token in String::from_utf8_lossy(bytes).split_whitespace() {
+    if let Ok(pid) = token.trim().parse::<u32>() {
+      push_pid(&mut pids, pid);
+    }
+  }
+  pids
+}
+
+#[cfg(windows)]
+fn netstat_listen_pids(port: u16) -> Vec<u32> {
+  let mut cmd = std::process::Command::new("netstat");
+  cmd.args(["-ano", "-p", "tcp"]);
+  hidden(&mut cmd);
+  let Ok(output) = cmd.output() else {
+    return Vec::new();
+  };
+  let suffix = format!(":{port}");
+  let mut pids = Vec::new();
+  for line in String::from_utf8_lossy(&output.stdout).lines() {
+    if !line.to_ascii_uppercase().contains("LISTENING") {
+      continue;
+    }
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    let Some(local) = cols.get(1) else { continue; };
+    if !local.ends_with(&suffix) {
+      continue;
+    }
+    if let Some(pid) = cols.last().and_then(|value| value.parse::<u32>().ok()) {
+      push_pid(&mut pids, pid);
+    }
+  }
+  pids
+}
+
+fn listener_pids(port: u16) -> Result<Vec<u32>, String> {
+  #[cfg(windows)]
+  {
+    let script = format!(
+      "Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | ForEach-Object {{ $_.OwningProcess }}"
+    );
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    hidden(&mut cmd);
+    if let Ok(output) = cmd.output() {
+      if output.status.success() {
+        let pids = parse_pids(&output.stdout);
+        if !pids.is_empty() {
+          return Ok(pids);
+        }
+      }
+    }
+    return Ok(netstat_listen_pids(port));
+  }
+  #[cfg(not(windows))]
+  {
+    let mut cmd = std::process::Command::new("lsof");
+    cmd.args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"]);
+    hidden(&mut cmd);
+    match cmd.output() {
+      Ok(output) => Ok(parse_pids(&output.stdout)),
+      Err(err) => Err(format!("Could not inspect port {port} ({err}). Stop the process using that port and try again.")),
+    }
+  }
+}
+
+fn kill_pid(pid: u32) {
+  #[cfg(windows)]
+  {
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+    hidden(&mut cmd);
+    let _ = cmd.output();
+  }
+  #[cfg(not(windows))]
+  {
+    let mut cmd = std::process::Command::new("kill");
+    cmd.arg(pid.to_string());
+    hidden(&mut cmd);
+    let _ = cmd.output();
+    if listening(SIDECAR_PORT) {
+      let mut force = std::process::Command::new("kill");
+      force.args(["-9", &pid.to_string()]);
+      hidden(&mut force);
+      let _ = force.output();
+    }
+  }
+}
+
+fn stop_port(port: u16) -> Result<(), String> {
+  if !listening(port) {
+    return Ok(());
+  }
+  let pids = listener_pids(port)?;
+  if pids.is_empty() {
+    return Err(format!(
+      "Port {port} is in use, but this app could not find that process. Close the other Predict engine and try again."
+    ));
+  }
+  for pid in pids {
+    kill_pid(pid);
+  }
+  for _ in 0..25 {
+    if !listening(port) {
+      return Ok(());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+  }
+  Err(format!("Port {port} is still in use after stopping the previous engine."))
+}
+
+fn log_tail(path: &std::path::Path) -> String {
+  let text = std::fs::read_to_string(path).unwrap_or_default();
+  let text = text_tail(&text, 1200);
+  if text.is_empty() {
+    "No log was written. Check that this Python can import uvicorn, fastapi, and the sidecar.".into()
+  } else {
+    text
+  }
+}
+
+fn start_user_sidecar(python: &std::path::Path, cwd: &std::path::Path) -> Result<(), String> {
+  let log_path = std::env::temp_dir().join("qdspace-user-python-sidecar.log");
+  let log_file = std::fs::File::create(&log_path).map_err(|err| format!("Could not log the sidecar: {err}"))?;
+  let stdout = log_file.try_clone().map_err(|err| format!("Could not log the sidecar: {err}"))?;
+  let mut cmd = std::process::Command::new(python);
+  cmd
+    .args(["-m", "uvicorn", "sidecar_app:app", "--host", "127.0.0.1", "--port", "8765"])
+    .current_dir(cwd)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::from(stdout))
+    .stderr(std::process::Stdio::from(log_file));
+  with_python_env(&mut cmd, python);
+  hidden(&mut cmd);
+  let mut child = cmd.spawn().map_err(|err| format!("Could not start the sidecar with this Python: {err}"))?;
+  for _ in 0..180 {
+    if listening(SIDECAR_PORT) {
+      std::mem::forget(child);
+      return Ok(());
+    }
+    match child.try_wait() {
+      Ok(Some(status)) => {
+        return Err(format!(
+          "The sidecar stopped before it opened port 8765 ({status}). {}",
+          log_tail(&log_path)
+        ));
+      }
+      Ok(None) => {}
+      Err(err) => return Err(format!("Could not check the sidecar: {err}")),
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+  }
+  let _ = child.kill();
+  let _ = child.wait();
+  Err(format!("The sidecar did not open port 8765. {}", log_tail(&log_path)))
+}
+
+fn device_label(probe: &Probe) -> &'static str {
+  if probe.cuda {
+    "GPU"
+  } else if probe.mps {
+    "MPS"
+  } else {
+    "CPU"
+  }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn command_output_text(output: &std::process::Output) -> String {
+  let mut text = output_text(&output.stdout);
+  let err = output_text(&output.stderr);
+  if !err.is_empty() {
+    if !text.is_empty() {
+      text.push('\n');
+    }
+    text.push_str(&err);
+  }
+  text
+}
+
+#[tauri::command]
+fn pick_python_path() -> Result<Option<String>, String> {
+  #[cfg(windows)]
+  {
+    return pick_python_path_windows();
+  }
+  #[cfg(target_os = "macos")]
+  {
+    return pick_python_path_macos();
+  }
+  #[cfg(all(unix, not(target_os = "macos")))]
+  {
+    return pick_python_path_linux();
+  }
+  #[cfg(not(any(windows, unix)))]
+  {
+    Err("Paste the path to python.exe. A file dialog is not available on this system.".into())
+  }
+}
+
+#[cfg(windows)]
+fn pick_python_path_windows() -> Result<Option<String>, String> {
+  let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Select the conda environment Python'
+$dialog.Filter = 'Python executable|python.exe;python;python3.exe|All files|*.*'
+$dialog.CheckFileExists = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::Out.Write($dialog.FileName)
+}
+"#;
+  let mut cmd = std::process::Command::new("powershell.exe");
+  // WindowStyle hides the console only. CREATE_NO_WINDOW can keep the file dialog from appearing.
+  cmd.args(["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", script]);
+  let output = cmd.output().map_err(|err| format!("Could not open a file dialog: {err}"))?;
+  if !output.status.success() {
+    return Err(command_error("Could not open a file dialog.", &output));
+  }
+  let path = output_text(&output.stdout);
+  if path.is_empty() {
+    Ok(None)
+  } else {
+    Ok(Some(path))
+  }
+}
+
+#[cfg(target_os = "macos")]
+fn pick_python_path_macos() -> Result<Option<String>, String> {
+  let mut cmd = std::process::Command::new("osascript");
+  cmd.args(["-e", "POSIX path of (choose file with prompt \"Select the conda environment Python\")"]);
+  hidden(&mut cmd);
+  let output = cmd.output().map_err(|err| format!("Could not open a file dialog: {err}"))?;
+  if !output.status.success() {
+    let detail = command_output_text(&output).to_lowercase();
+    if detail.contains("cancel") || detail.contains("-128") {
+      return Ok(None);
+    }
+    return Err(command_error("Could not open a file dialog.", &output));
+  }
+  let path = output_text(&output.stdout);
+  if path.is_empty() { Ok(None) } else { Ok(Some(path)) }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pick_python_path_linux() -> Result<Option<String>, String> {
+  let mut cmd = std::process::Command::new("zenity");
+  cmd.args(["--file-selection", "--title=Select the conda environment Python"]);
+  hidden(&mut cmd);
+  match cmd.output() {
+    Ok(output) if output.status.success() => {
+      let path = output_text(&output.stdout);
+      if path.is_empty() { Ok(None) } else { Ok(Some(path)) }
+    }
+    Ok(output) if output.status.code() == Some(1) => Ok(None),
+    Ok(output) => Err(command_error("Could not open a file dialog. Paste the Python path instead.", &output)),
+    Err(_) => Err("Paste the path to the conda environment Python. A file dialog is not available.".into()),
+  }
+}
+
+/// Check torch, CUDA, and which sidecar libraries are missing. Does not install or restart the sidecar.
+#[tauri::command]
+async fn check_user_python(app: tauri::AppHandle, python_path: String) -> Result<PythonCheck, String> {
+  off_ui_thread(move || check_user_python_impl(&app, &python_path)).await
+}
+
+/// Install only the confirmed missing libraries into this interpreter, then start the sidecar on port 8765.
+/// An empty list installs nothing and only switches the sidecar when the check already passed.
+#[tauri::command]
+async fn apply_user_python(app: tauri::AppHandle, python_path: String, packages: Vec<String>) -> Result<UserPythonInfo, String> {
+  off_ui_thread(move || {
+    let (python_path, python) = validate_user_python(&app, &python_path)?;
+    let (probe, installed_mace) = install_confirmed(&python, &packages)?;
+    switch_user_sidecar(&app, &python, python_path, &probe, installed_mace)
+  })
+  .await
 }
