@@ -222,8 +222,7 @@ function materializeSymlinks(root) {
       const p = path.join(dir, ent.name);
       if (ent.isSymbolicLink()) {
         const link = fs.readlinkSync(p);
-        if (path.isAbsolute(link)) fail(`refusing absolute symlink ${p} -> ${link}`);
-        const target = path.resolve(path.dirname(p), link);
+        const target = path.isAbsolute(link) ? link : path.resolve(path.dirname(p), link);
         if (!fs.existsSync(target)) fail(`dangling symlink ${p} -> ${link}`);
         const st = fs.statSync(target);
         fs.unlinkSync(p);
@@ -259,9 +258,11 @@ async function buildDarwin() {
     fail(`standalone archive has no python/bin/python3.11 (${url})`);
   }
   fs.cpSync(extracted, runtime, { recursive: true, dereference: false });
+  // Copy symlink targets while the unpack folder still exists. The standalone
+  // man pages point at that folder with an absolute path.
+  materializeSymlinks(runtime);
   fs.rmSync(tmp, { recursive: true, force: true });
   installPackages(path.join(runtime, 'bin', 'python3.11'));
-  materializeSymlinks(runtime);
   for (const name of ['python', 'python3', 'python3.11']) {
     const bin = path.join(runtime, 'bin', name);
     if (!fs.existsSync(bin)) continue;
