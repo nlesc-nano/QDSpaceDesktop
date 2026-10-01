@@ -50,6 +50,9 @@ jobs:
         run: npm install
 
       - name: Build bundled CPU MACE runtime
+        env:
+          # macos-latest is arm64. The x86_64 DMG must not bundle that interpreter.
+          QDSPACE_MAC_ARCH: ${{ contains(matrix.args, 'x86_64-apple-darwin') && 'x86_64' || 'aarch64' }}
         run: node scripts/build-mace-runtime.mjs
 
       - uses: tauri-apps/tauri-action@v0

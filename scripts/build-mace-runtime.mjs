@@ -5,7 +5,9 @@
  * Layout (what the installer launches):
  *   Windows:  mace-runtime/python.exe
  *             mace-runtime/app/{sidecar_app.py,mace_engine.py,nequip_engine.py,models/}
- *   Unix:     mace-runtime/bin/python   (venv from Python 3.11; CI uses actions/setup-python)
+ *   macOS:    mace-runtime/bin/python   (python-build-standalone CPython 3.11, not a venv)
+ *             mace-runtime/app/...
+ *   Linux:    mace-runtime/bin/python   (venv from Python 3.11; CI uses actions/setup-python)
  *             mace-runtime/app/...
  *
  * Launch (cwd = mace-runtime/app):
@@ -15,12 +17,15 @@
  * (~61 MB, committed). If that file is missing, this script downloads the public
  * MACE-MP-0 large asset and fails if the download does not land a real checkpoint.
  *
- * Unix venvs are not relocatable: bin/python points at the interpreter that
- * created them (the GitHub runner's setup-python). Windows uses the official
- * embeddable CPython zip, which is self-contained.
+ * Linux venvs are not relocatable: bin/python points at the interpreter that
+ * created them (the GitHub runner's setup-python). macOS does not use a venv.
+ * It unpacks Astral's install_only CPython and replaces relative symlinks with
+ * real files so the DMG does not ship a dangling bin/python. Windows uses the
+ * official embeddable CPython zip, which is self-contained.
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,6 +35,9 @@ const MODEL_URL =
 const MIN_MODEL_BYTES = 1_000_000;
 const EMBED_URL = 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip';
 const GET_PIP_URL = 'https://bootstrap.pypa.io/get-pip.py';
+// install_only assets on tag 20260929 (cpython 3.11.16, aarch64 and x86_64 apple-darwin).
+const PBS_TAG = '20260929';
+const PBS_PYTHON = '3.11.16';
 const TORCH_INDEX = 'https://download.pytorch.org/whl/cpu';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -193,8 +201,80 @@ function buildUnix() {
   installPackages(py);
 }
 
+function darwinArch() {
+  const requested = process.env.QDSPACE_MAC_ARCH;
+  if (requested === 'aarch64' || requested === 'x86_64') return requested;
+  if (requested) fail(`QDSPACE_MAC_ARCH must be aarch64 or x86_64, got ${requested}`);
+  if (process.arch === 'arm64') return 'aarch64';
+  if (process.arch === 'x64') return 'x86_64';
+  fail(`unsupported Mac arch ${process.arch}; set QDSPACE_MAC_ARCH to aarch64 or x86_64`);
+}
+
+// Tauri resource packaging can turn a symlink into a plain file that no longer
+// points at its target. python-build-standalone ships relative symlinks
+// (bin/python -> python3.11). Copy each one to a real file or directory.
+function materializeSymlinks(root) {
+  const stack = [root];
+  let copiedDirs = 0;
+  while (stack.length) {
+    const dir = stack.pop();
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, ent.name);
+      if (ent.isSymbolicLink()) {
+        const link = fs.readlinkSync(p);
+        if (path.isAbsolute(link)) fail(`refusing absolute symlink ${p} -> ${link}`);
+        const target = path.resolve(path.dirname(p), link);
+        if (!fs.existsSync(target)) fail(`dangling symlink ${p} -> ${link}`);
+        const st = fs.statSync(target);
+        fs.unlinkSync(p);
+        if (st.isDirectory()) {
+          copiedDirs += 1;
+          if (copiedDirs > 1000) fail(`too many directory symlinks under ${root}`);
+          fs.cpSync(target, p, { recursive: true, dereference: false });
+          stack.push(p);
+        } else {
+          fs.copyFileSync(target, p);
+          fs.chmodSync(p, st.mode & 0o777);
+        }
+      } else if (ent.isDirectory()) {
+        stack.push(p);
+      }
+    }
+  }
+}
+
+async function buildDarwin() {
+  const arch = darwinArch();
+  const filename = `cpython-${PBS_PYTHON}+${PBS_TAG}-${arch}-apple-darwin-install_only.tar.gz`;
+  const url = `https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${filename}`;
+  console.log(`macOS standalone CPython ${PBS_PYTHON} for ${arch}`);
+  fs.rmSync(runtime, { recursive: true, force: true });
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'qdspace-cpython-'));
+  const archive = path.join(tmp, filename);
+  await download(url, archive);
+  run('tar', ['-xzf', archive, '-C', tmp]);
+  const extracted = path.join(tmp, 'python');
+  if (!fs.existsSync(path.join(extracted, 'bin', 'python3.11'))) {
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fail(`standalone archive has no python/bin/python3.11 (${url})`);
+  }
+  fs.cpSync(extracted, runtime, { recursive: true, dereference: false });
+  fs.rmSync(tmp, { recursive: true, force: true });
+  installPackages(path.join(runtime, 'bin', 'python3.11'));
+  materializeSymlinks(runtime);
+  for (const name of ['python', 'python3', 'python3.11']) {
+    const bin = path.join(runtime, 'bin', name);
+    if (!fs.existsSync(bin)) continue;
+    if (fs.lstatSync(bin).isSymbolicLink()) fail(`bin/${name} is still a symlink`);
+    fs.chmodSync(bin, fs.statSync(bin).mode | 0o755);
+  }
+  const py = path.join(runtime, 'bin', 'python');
+  if (!fs.existsSync(py)) fail('standalone tree has no bin/python');
+}
+
 const modelPath = await ensureModel();
 if (isWin) await buildWindows();
+else if (process.platform === 'darwin') await buildDarwin();
 else buildUnix();
 copyApp(modelPath);
 
