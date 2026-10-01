@@ -10,6 +10,13 @@
 
   let currentRoute = $state('home');
   const desktop = isDesktopApp();
+
+  // Library -> Builder hand-off (open a library structure in post-treatment)
+  let builderHandoff = $state(null);
+  function openInBuilder(handoff) {
+    builderHandoff = handoff;
+    currentRoute = 'builder';
+  }
 </script>
 
 <div class="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
@@ -23,9 +30,9 @@
     {:else if currentRoute === 'contact'}
       <Contact />
     {:else if currentRoute === 'builder'}
-      <Builder />
+      <Builder handoff={builderHandoff} onHandoffConsumed={() => (builderHandoff = null)} />
     {:else if currentRoute === 'library'}
-      <Library />
+      <Library onOpenInBuilder={openInBuilder} />
     {:else if currentRoute === 'predict' && desktop}
       <Predict />
     {/if}

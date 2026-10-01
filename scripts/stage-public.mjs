@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 const dest = resolve("public-release");
 rmSync(dest, { recursive: true, force: true });
 mkdirSync(dest, { recursive: true });
-for (const name of ["metadata.json", "file_list.json", "vite.svg", "favicon.png", "favicon.ico"]) {
+for (const name of ["library_index.json", "metadata.json", "file_list.json", "vite.svg", "favicon.png", "favicon.ico"]) {
   const src = resolve("public", name);
   if (existsSync(src)) cpSync(src, resolve(dest, name));
 }

@@ -273,7 +273,7 @@
 
   <!-- Embedded Selector Toolbar Removed (Moved to header by parent) -->
 
-  {#if !props.xyz}
+  {#if !props.xyz && !(props.isMD && props.dataUrl)}
     <div class="p-4 flex items-center justify-center h-full text-slate-500 font-medium bg-slate-900 rounded-[1.5rem]" style="min-height: 400px; height: 100%;">
       No structure loaded
     </div>
