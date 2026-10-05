@@ -26,6 +26,9 @@
 
   let payloadText = $state(JSON.stringify(DEMO, null, 2));
   let loading = $state(false);
+  let predictCancelling = $state(false);
+  let predictAbort = null;
+  let cancelledNote = $state('');
   let error = $state(null);
   let result = $state(null);
   let clientMs = $state(null);
@@ -124,6 +127,7 @@
     try {
       return await fetch(url, options);
     } catch (e) {
+      if (e?.name === 'AbortError' || options?.signal?.aborted) throw e;
       const message = await waitForSidecarFailure();
       if (message) throw new Error(message);
       throw e;
@@ -524,6 +528,7 @@
     clientMs = null;
     openStat = null;
     error = null;
+    cancelledNote = '';
   }
 
   async function loadSample(sample) {
@@ -732,16 +737,39 @@
     useBuiltInModel();
   }
 
+  function isPredictCancelError(e, aborted) {
+    if (aborted) return true;
+    if (!e) return false;
+    if (e.name === 'AbortError') return true;
+    const message = String(e.message || e || '');
+    return /prediction cancelled/i.test(message) || /The user aborted a request/i.test(message);
+  }
+
+  async function cancelPredict() {
+    if (!loading || predictCancelling) return;
+    predictCancelling = true;
+    try {
+      await fetch(`${SIDECAR_BASE}/cancel-predict`, { method: 'POST' }).catch(() => null);
+    } finally {
+      if (predictAbort) predictAbort.abort();
+    }
+  }
+
   async function runPredict() {
+    if (loading) return;
     if (installing) {
       notePredictBlocked();
       return;
     }
     predictBlockNote = '';
+    cancelledNote = '';
     loading = true;
+    predictCancelling = false;
     error = null;
     result = null;
     clientMs = null;
+    const controller = new AbortController();
+    predictAbort = controller;
     const t0 = performance.now();
     try {
       let body;
@@ -757,13 +785,21 @@
       const res = await sidecarFetch(predictAll ? `${SIDECAR_BASE}/predict-frames` : `${SIDECAR_BASE}/predict`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify(predictAll
           ? { filename: structureName || 'trajectory.xyz', text: sourceText, device: deviceChoice, engine: engineChoice, model_path: modelPath.trim() || null, head: heads.length > 1 ? headChoice : null }
           : { ...body, device: deviceChoice, engine: engineChoice, model_path: modelPath.trim() || null, head: heads.length > 1 ? headChoice : null }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(data.detail || data.message || `HTTP ${res.status}`);
+        const detail = data.detail || data.message || `HTTP ${res.status}`;
+        if (res.status === 409 || /prediction cancelled/i.test(String(detail))) {
+          throw new Error('Prediction cancelled');
+        }
+        throw new Error(detail);
+      }
+      if (controller.signal.aborted) {
+        throw new Error('Prediction cancelled');
       }
       if (predictAll) {
         const first = data.frames?.[0];
@@ -776,9 +812,17 @@
       }
       clientMs = performance.now() - t0;
     } catch (e) {
-      error = e.message || String(e);
+      if (isPredictCancelError(e, controller.signal.aborted)) {
+        cancelledNote = 'Prediction cancelled.';
+        error = null;
+        result = null;
+      } else {
+        error = e.message || String(e);
+      }
     } finally {
+      if (predictAbort === controller) predictAbort = null;
       loading = false;
+      predictCancelling = false;
     }
   }
   if (keptHeads) applyHeads(keptHeads.found, keptHeads.selected);
@@ -792,16 +836,28 @@
     </div>
 
     <div class="flex flex-col gap-3">
-      <div class="relative">
-        <button type="button" class="w-full px-4 py-2.5 rounded-lg text-sm font-semibold bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50" onclick={runPredict} disabled={loading || installing}>
-          {loading ? 'Predicting…' : 'Run predict'}
-        </button>
-        {#if installing}
-          <button type="button" class="absolute inset-0 cursor-not-allowed rounded-lg" aria-label="Install in progress" onclick={notePredictBlocked}></button>
+      <div class="relative space-y-2">
+        {#if loading}
+          <button type="button" class="w-full px-4 py-2.5 rounded-lg text-sm font-semibold bg-brand-600 text-white disabled:opacity-50" disabled>
+            Predicting…
+          </button>
+          <button type="button" class="w-full px-4 py-2.5 rounded-lg text-sm font-semibold border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-50" onclick={cancelPredict} disabled={predictCancelling}>
+            {predictCancelling ? 'Cancelling…' : 'Cancel'}
+          </button>
+        {:else}
+          <button type="button" class="w-full px-4 py-2.5 rounded-lg text-sm font-semibold bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50" onclick={runPredict} disabled={installing}>
+            Run predict
+          </button>
+          {#if installing}
+            <button type="button" class="absolute inset-0 cursor-not-allowed rounded-lg" aria-label="Install in progress" onclick={notePredictBlocked}></button>
+          {/if}
         {/if}
       </div>
       {#if predictBlockNote}
         <p class="text-xs text-slate-600">{predictBlockNote}</p>
+      {/if}
+      {#if cancelledNote}
+        <p class="text-xs text-amber-900 rounded-xl bg-amber-50 border border-amber-200 p-3">{cancelledNote}</p>
       {/if}
 
       <div>
@@ -978,11 +1034,11 @@
           {#if result}
             <button class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700" onclick={downloadResultXyz}><span aria-hidden="true">↓</span>Download XYZ file</button>
           {/if}
-          {#if loading}<span class="text-xs font-medium text-brand-600">Running…</span>{/if}
+          {#if loading}<span class="text-xs font-medium text-brand-600">{predictCancelling ? 'Cancelling…' : 'Running…'}</span>{/if}
         </div>
       </div>
       {#if !result && !loading}
-        <p class="text-sm text-slate-500">Energy and forces show up here after you run predict.</p>
+        <p class="text-sm text-slate-500">{cancelledNote || 'Energy and forces show up here after you run predict.'}</p>
       {:else if result}
         <div class="flex flex-wrap items-start gap-3 mb-3">
           <div class="min-w-[260px] max-w-3xl flex-1 rounded-xl border border-slate-200 border-l-4 border-blue-500 bg-white p-2 shadow-sm">

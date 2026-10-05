@@ -12,6 +12,7 @@ Model is lazy-loaded on the first /predict (or /health with ?warmup=true).
 """
 from __future__ import annotations
 
+import threading
 import time
 from io import StringIO
 from pathlib import Path
@@ -43,6 +44,24 @@ app.add_middleware(
 
 _calcs = {}
 _load_s: Optional[float] = None
+_predict_cancel = threading.Event()
+
+
+class PredictionCancelled(Exception):
+    """Raised when the user cancels an in-flight prediction."""
+
+
+def clear_predict_cancel() -> None:
+    _predict_cancel.clear()
+
+
+def request_predict_cancel() -> None:
+    _predict_cancel.set()
+
+
+def check_predict_cancel() -> None:
+    if _predict_cancel.is_set():
+        raise PredictionCancelled("Prediction cancelled")
 
 
 class PredictRequest(BaseModel):
@@ -270,6 +289,7 @@ def predict(req: PredictRequest):
         if len(p) != 3:
             raise HTTPException(400, "each position must be length 3")
 
+    clear_predict_cancel()
     t0 = time.perf_counter()
     chosen = (req.device or "cpu").lower()
     engine = (req.engine or "mace").lower()
@@ -281,7 +301,11 @@ def predict(req: PredictRequest):
     key = engine_mod.cache_key(path, chosen, head)
     first_load = key not in _calcs
     try:
+        check_predict_cancel()
         calc, model_name = get_calculator(chosen, engine, req.model_path, req.head)
+        check_predict_cancel()
+    except PredictionCancelled:
+        raise HTTPException(409, "Prediction cancelled")
     except Exception as e:
         raise HTTPException(500, str(e)) from e
 
@@ -296,8 +320,11 @@ def predict(req: PredictRequest):
     atoms = Atoms(symbols=req.symbols, positions=req.positions, **kwargs)
     atoms.calc = calc
     try:
+        check_predict_cancel()
         energy = float(atoms.get_potential_energy())
         forces = atoms.get_forces().tolist()
+    except PredictionCancelled:
+        raise HTTPException(409, "Prediction cancelled")
     except Exception as e:
         raise HTTPException(500, f"calculator failure: {e}") from e
     latency_ms = (time.perf_counter() - t0) * 1000
@@ -323,8 +350,16 @@ class TrajectoryRequest(BaseModel):
     head: Optional[str] = None
 
 
+@app.post("/cancel-predict")
+async def cancel_predict():
+    """Ask the in-flight /predict or /predict-frames loop to stop soon."""
+    request_predict_cancel()
+    return {"status": "cancelling"}
+
+
 @app.post("/predict-frames")
 def predict_frames(req: TrajectoryRequest):
+    clear_predict_cancel()
     try:
         frames = read_xyz_frames(req.text)
     except ValueError as e:
@@ -333,12 +368,17 @@ def predict_frames(req: TrajectoryRequest):
     chosen = (req.device or "cpu").lower()
     engine = (req.engine or "mace").lower()
     try:
+        check_predict_cancel()
         calc, model_name = get_calculator(chosen, engine, req.model_path, req.head)
+        check_predict_cancel()
+    except PredictionCancelled:
+        raise HTTPException(409, "Prediction cancelled")
     except Exception as e:
         raise HTTPException(500, str(e)) from e
     out = []
     try:
         for atoms in frames:
+            check_predict_cancel()
             atoms.calc = calc
             energy = float(atoms.get_potential_energy())
             forces = atoms.get_forces().tolist()
@@ -346,6 +386,8 @@ def predict_frames(req: TrajectoryRequest):
             item["energy"] = energy
             item["forces"] = forces
             out.append(item)
+    except PredictionCancelled:
+        raise HTTPException(409, "Prediction cancelled")
     except Exception as e:
         raise HTTPException(500, f"calculator failure: {e}") from e
     return {
@@ -361,6 +403,6 @@ def predict_frames(req: TrajectoryRequest):
 def root():
     return {
         "service": "qdspace-mace-sidecar",
-        "endpoints": ["POST /health", "GET /heads", "POST /model", "POST /structure", "POST /predict", "POST /predict-frames"],
+        "endpoints": ["POST /health", "GET /heads", "POST /model", "POST /structure", "POST /predict", "POST /predict-frames", "POST /cancel-predict"],
         "docs": "/docs",
     }
