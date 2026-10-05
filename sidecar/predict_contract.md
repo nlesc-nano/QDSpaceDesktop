@@ -115,6 +115,97 @@ Compute potential **energy** (eV) and per-atom **forces** (eV/Å) for a structur
 
 ---
 
+## `POST /predict-frames-stream`
+
+Predict every frame of a multi-frame XYZ and send each result **as soon as that frame is done**, so the app can show "Frame 1000 of 1600" and the latest energy/forces while the run continues. `POST /predict-frames` still exists and returns everything in one JSON response at the end.
+
+### Request body
+
+Same as `/predict-frames`:
+
+```json
+{ "filename": "traj.xyz", "text": "<whole .xyz file>", "device": "cpu", "engine": "mace", "model_path": null, "head": null }
+```
+
+### Response `200` — `application/x-ndjson`
+
+One JSON object per line, each with a `type`:
+
+| `type` | Fields | When |
+|--------|--------|------|
+| `start` | `n_frames` | Right away, before the model loads |
+| `ready` | `device`, `model`, `cold_load_s` | Model is loaded (`cold_load_s` is set only if this request loaded it) |
+| `frame` | `index` (0-based), `n_frames`, `energy`, `forces`, `symbols`, `positions`, `cell`, `pbc`, `n_atoms`, `formula`, `latency_ms` (this frame), `elapsed_ms` (since the request started) | After each frame |
+| `done` | `n_frames`, `latency_ms` | Every frame finished; last line |
+| `cancelled` | `completed`, `n_frames` | `POST /cancel-predict` stopped the run between frames; last line |
+| `error` | `message`, `completed`, `n_frames`, `index` (if a frame failed) | Model load or a frame failed; last line |
+
+```text
+{"type":"start","n_frames":1600}
+{"type":"ready","device":"cpu","model":"mace-mp-0-large","cold_load_s":null}
+{"symbols":["O","H","H"],"positions":[...],"cell":null,"pbc":false,"n_atoms":3,"formula":"H2O","energy":-14.18,"forces":[...],"type":"frame","index":0,"n_frames":1600,"latency_ms":41.2,"elapsed_ms":45.0}
+...
+{"type":"done","n_frames":1600,"latency_ms":65321.7}
+```
+
+Unreadable XYZ text still fails up front with HTTP `400`. A stream that ends without `done`, `cancelled` or `error` means the process stopped.
+
+### Cancel
+
+`POST /cancel-predict` sets a flag the loop checks before each frame; the stream then ends with a `cancelled` line. Closing the connection (the app aborts its fetch) also stops the loop after the frame in progress. The app keeps the frames that already arrived.
+
+```bash
+curl -sN -X POST http://127.0.0.1:8765/predict-frames-stream \
+  -H 'Content-Type: application/json' \
+  -d '{"filename":"traj.xyz","text":"3\nframe 1\nO 0 0 0\nH 0.757 0.586 0\nH -0.757 0.586 0\n"}'
+```
+
+---
+
+## `POST /predict-frames-job` + `GET /predict-frames-job/{job_id}` (used by the desktop app)
+
+Same work as `/predict-frames-stream`, but as a background job the app polls. The Tauri window on Windows (WebView2) can buffer a streamed `fetch` body until the response ends, so stream progress may show up all at once. Short polls always complete, so the "Frame N of M" counter stays live. The app tries this first and falls back to `/predict-frames-stream`, then `/predict-frames`, on older sidecars.
+
+### Start — `POST /predict-frames-job`
+
+Body: same as `/predict-frames`. Returns right away (model loading happens in the job):
+
+```json
+{ "job_id": "3f2a…", "n_frames": 1600, "status": "starting" }
+```
+
+Unreadable XYZ text still fails with HTTP `400`. Starting a new job cancels any job still running.
+
+### Poll — `GET /predict-frames-job/{job_id}?after=N`
+
+```json
+{
+  "job_id": "3f2a…", "status": "running", "done": 412, "total": 1600, "after": 400,
+  "frames": [ { "index": 400, "energy": -14.18, "forces": [...], "symbols": [...], "positions": [...], "cell": null, "pbc": false, "n_atoms": 3, "formula": "H2O", "n_frames": 1600, "latency_ms": 41.2, "elapsed_ms": 16500.3 }, … ],
+  "device": "cpu", "model": "mace-mp-0-large", "cold_load_s": null, "latency_ms": 16510.0,
+  "cancelled": false, "error": null, "error_index": null
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `status` | `starting`, `loading` (model), `running`, `done`, `cancelled`, `error` |
+| `done` / `total` | Frames finished / frames in the file |
+| `frames` | Finished frames with `index >= after` (pass the number of frames you already have) |
+| `error`, `error_index` | Set when `status` is `error` |
+
+`404` means the job is unknown (the sidecar restarted, or it was pruned; the newest 4 finished jobs are kept). The app polls about every 200 ms.
+
+`POST /cancel-predict` also stops jobs between frames; the job ends with `status: "cancelled"` and keeps the frames that finished, so one more poll returns them.
+
+```bash
+JOB=$(curl -s -X POST http://127.0.0.1:8765/predict-frames-job -H 'Content-Type: application/json' \
+  -d '{"filename":"traj.xyz","text":"3\nframe 1\nO 0 0 0\nH 0.757 0.586 0\nH -0.757 0.586 0\n"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
+curl -s "http://127.0.0.1:8765/predict-frames-job/$JOB?after=0"
+```
+
+---
+
 ## Frontend integration notes
 
 1. Prefer starting the sidecar when the user opens an ML panel; call `POST /health?warmup=true` in the background to hide cold-start cost.

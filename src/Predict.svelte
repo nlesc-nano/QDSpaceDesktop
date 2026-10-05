@@ -30,7 +30,14 @@
   let predictAbort = null;
   let cancelledNote = $state('');
   let error = $state(null);
-  let result = $state(null);
+  // Raw (not deeply reactive): an all-frames run can hold thousands of frames.
+  let result = $state.raw(null);
+  // Streaming Predict all frames: progress, and which result frame is shown.
+  let streamDone = $state(0);
+  let streamTotal = $state(0);
+  let followLatest = $state(true);
+  let resultIndex = $state(0);
+  let activeStream = null;
   let clientMs = $state(null);
   let fileNote = $state(null);
   let structureName = $state('');
@@ -468,7 +475,9 @@
     if (result?.frames?.length) {
       const predicted = result.frames[index];
       if (predicted) {
-        result = { ...result, energy: predicted.energy, forces: predicted.forces, n_atoms: predicted.n_atoms };
+        result = { ...result, energy: predicted.energy, forces: predicted.forces, n_atoms: predicted.n_atoms, symbols: predicted.symbols };
+        resultIndex = index;
+        if (loading) followLatest = false;
       }
     }
   }
@@ -483,8 +492,12 @@
     try { return JSON.parse(payloadText).symbols || []; } catch { return []; }
   }
 
+  function resultSymbols() {
+    return Array.isArray(result?.symbols) ? result.symbols : symbolsOf();
+  }
+
   function forceLines(forces) {
-    const symbols = symbolsOf();
+    const symbols = resultSymbols();
     return forces.map((f, i) => {
       const el = String(symbols[i] || '').padEnd(3);
       const nums = f.map((v) => Number(v).toFixed(6).padStart(12)).join('  ');
@@ -494,7 +507,7 @@
 
   function composition() {
     const counts = {};
-    for (const el of symbolsOf()) counts[el] = (counts[el] || 0) + 1;
+    for (const el of resultSymbols()) counts[el] = (counts[el] || 0) + 1;
     return Object.entries(counts).map(([el, n]) => `${el} ${n}`).join(', ');
   }
 
@@ -583,8 +596,10 @@
     const frame = result.frames[index];
     if (!frame) return;
     shownFrame = index;
+    resultIndex = index;
+    if (loading) followLatest = false;
     originalEnergy = energyFromXyzFrame(sourceText, index);
-    result = { ...result, energy: frame.energy, forces: frame.forces, n_atoms: frame.n_atoms };
+    result = { ...result, energy: frame.energy, forces: frame.forces, n_atoms: frame.n_atoms, symbols: frame.symbols };
     payloadText = JSON.stringify({
       symbols: frame.symbols,
       positions: frame.positions,
@@ -755,6 +770,291 @@
     }
   }
 
+  function originalEnergyFor(index) {
+    const parsed = structureFrames[index];
+    if (parsed) return parsed.energy ?? null;
+    // Scanning the whole XYZ text is too slow to repeat while frames stream in.
+    return loading ? null : energyFromXyzFrame(sourceText, index);
+  }
+
+  // Push streamed frames into Results. Throttled so a fast run does not re-render per frame.
+  function flushStream(stream) {
+    if (stream.timer) {
+      clearTimeout(stream.timer);
+      stream.timer = null;
+    }
+    if (activeStream !== stream) return;
+    const frames = stream.frames;
+    streamDone = frames.length;
+    if (!frames.length) return;
+    const last = frames.length - 1;
+    const base = {
+      device: stream.meta.device || stream.device,
+      model: stream.meta.model || '',
+      latency_ms: stream.meta.latency_ms ?? frames[last].elapsed_ms,
+      cold_load_s: stream.meta.cold_load_s ?? null,
+      n_frames: frames.length,
+      frames: frames.slice(),
+    };
+    if (followLatest || !result?.frames) {
+      const frame = frames[last];
+      resultIndex = last;
+      originalEnergy = originalEnergyFor(last);
+      result = { ...base, energy: frame.energy, forces: frame.forces, n_atoms: frame.n_atoms, symbols: frame.symbols };
+    } else {
+      result = { ...result, ...base };
+    }
+  }
+
+  function scheduleFlush(stream) {
+    if (stream.timer) return;
+    stream.timer = setTimeout(() => {
+      stream.timer = null;
+      flushStream(stream);
+    }, 120);
+  }
+
+  function jumpToLatest() {
+    followLatest = true;
+    if (activeStream) flushStream(activeStream);
+  }
+
+  // Read newline-delimited JSON from a fetch body, one event per line, as it arrives.
+  async function readNdjson(res, onEvent) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline).trim();
+          buffer = buffer.slice(newline + 1);
+          if (line) onEvent(JSON.parse(line));
+        }
+      }
+      buffer += decoder.decode();
+      if (buffer.trim()) onEvent(JSON.parse(buffer));
+    } catch (e) {
+      reader.cancel().catch(() => {});
+      throw e;
+    }
+  }
+
+  async function predictErrorFrom(res) {
+    const data = await res.json().catch(() => ({}));
+    const detail = data.detail || data.message || `HTTP ${res.status}`;
+    if (res.status === 409 || /prediction cancelled/i.test(String(detail))) {
+      return new Error('Prediction cancelled');
+    }
+    return new Error(detail);
+  }
+
+  // Older sidecar without /predict-frames-stream: one request, results at the end.
+  async function runFramesAtOnce(stream, controller, options) {
+    const res = await sidecarFetch(`${SIDECAR_BASE}/predict-frames`, { ...options, signal: controller.signal });
+    if (!res.ok) throw await predictErrorFrom(res);
+    const data = await res.json().catch(() => ({}));
+    if (controller.signal.aborted) throw new Error('Prediction cancelled');
+    if (!data.frames?.length) throw new Error('No frames came back.');
+    stream.meta = { device: data.device, model: data.model, latency_ms: data.latency_ms };
+    stream.frames = data.frames;
+    followLatest = false;
+    flushStream(stream);
+    const first = data.frames[0];
+    resultIndex = 0;
+    originalEnergy = originalEnergyFor(0);
+    result = { ...result, energy: first.energy, forces: first.forces, n_atoms: first.n_atoms, symbols: first.symbols };
+  }
+
+  async function runFrameStream(stream, controller, request) {
+    const options = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    };
+    const res = await sidecarFetch(`${SIDECAR_BASE}/predict-frames-stream`, { ...options, signal: controller.signal });
+    if (res.status === 404 || res.status === 405) {
+      await runFramesAtOnce(stream, controller, options);
+      return;
+    }
+    if (!res.ok) throw await predictErrorFrom(res);
+    if (!res.body?.getReader) throw new Error('This window cannot read streamed results.');
+    let finished = false;
+    try {
+      await readNdjson(res, (event) => {
+        if (activeStream !== stream) return;
+        switch (event?.type) {
+          case 'start':
+            if (Number.isFinite(event.n_frames)) {
+              stream.total = event.n_frames;
+              streamTotal = event.n_frames;
+            }
+            break;
+          case 'ready':
+            stream.meta = { ...stream.meta, device: event.device, model: event.model, cold_load_s: event.cold_load_s };
+            break;
+          case 'frame':
+            stream.frames.push(event);
+            scheduleFlush(stream);
+            break;
+          case 'done':
+            stream.meta = { ...stream.meta, latency_ms: event.latency_ms };
+            finished = true;
+            break;
+          case 'cancelled':
+            throw new Error('Prediction cancelled');
+          case 'error':
+            throw new Error(event.message || 'Prediction failed');
+          default:
+            break;
+        }
+      });
+    } catch (e) {
+      if (isPredictCancelError(e, controller.signal.aborted)) throw e;
+      if (e instanceof TypeError) {
+        // The connection dropped mid-run, usually because the Python process stopped.
+        const message = await waitForSidecarFailure();
+        if (message) throw new Error(message);
+      }
+      throw e;
+    }
+    if (controller.signal.aborted) throw new Error('Prediction cancelled');
+    if (!finished) {
+      throw new Error(`The prediction stopped early after ${stream.frames.length} of ${stream.total} frames.`);
+    }
+    flushStream(stream);
+  }
+
+  // Predict all frames as a sidecar job polled with short requests. WebView2 (the Tauri
+  // window on Windows) can hold a streamed fetch body until the response ends, so
+  // /predict-frames-stream progress may arrive all at once; plain polls always complete.
+  const JOB_POLL_MS = 200;
+  const JOB_POLL_RETRIES = 3;
+
+  function pollDelay(ms, signal) {
+    return new Promise((resolve) => {
+      if (signal.aborted) return resolve();
+      const timer = setTimeout(done, ms);
+      function done() {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', done);
+        resolve();
+      }
+      signal.addEventListener('abort', done, { once: true });
+    });
+  }
+
+  // Add frames from one poll, in order, and update meta.
+  function applyJobSnapshot(stream, data) {
+    if (Number.isFinite(data.total) && data.total > 0 && data.total !== stream.total) {
+      stream.total = data.total;
+      streamTotal = data.total;
+    }
+    stream.meta = {
+      ...stream.meta,
+      device: data.device || stream.meta.device,
+      model: data.model || stream.meta.model,
+      cold_load_s: data.cold_load_s ?? stream.meta.cold_load_s ?? null,
+    };
+    let added = 0;
+    for (const frame of data.frames || []) {
+      if (frame?.index !== stream.frames.length) continue;
+      stream.frames.push(frame);
+      added += 1;
+    }
+    return added;
+  }
+
+  async function fetchJobSnapshot(stream, signal) {
+    const url = `${SIDECAR_BASE}/predict-frames-job/${encodeURIComponent(stream.jobId)}?after=${stream.frames.length}`;
+    const res = await fetch(url, { cache: 'no-store', signal });
+    if (res.status === 404) throw new Error('The prediction job was lost. The Python process may have restarted.');
+    if (!res.ok) throw await predictErrorFrom(res);
+    return res.json();
+  }
+
+  // After Cancel, grab frames that finished since the last poll so Results keep them.
+  async function collectLastJobFrames(stream) {
+    if (!stream.jobId) return;
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), 1500);
+    try {
+      const data = await fetchJobSnapshot(stream, timeout.signal);
+      applyJobSnapshot(stream, data);
+    } catch {
+      // Keep what we already have.
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function runFrameJob(stream, controller, request) {
+    const res = await sidecarFetch(`${SIDECAR_BASE}/predict-frames-job`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+    if (res.status === 404 || res.status === 405) {
+      // Older sidecar without jobs.
+      await runFrameStream(stream, controller, request);
+      return;
+    }
+    if (!res.ok) throw await predictErrorFrom(res);
+    const started = await res.json().catch(() => ({}));
+    if (!started.job_id) throw new Error('The sidecar did not start a prediction job.');
+    stream.jobId = started.job_id;
+    if (Number.isFinite(started.n_frames) && started.n_frames > 0) {
+      stream.total = started.n_frames;
+      streamTotal = started.n_frames;
+    }
+    let failures = 0;
+    try {
+      for (;;) {
+        if (controller.signal.aborted) throw new Error('Prediction cancelled');
+        let data;
+        try {
+          data = await fetchJobSnapshot(stream, controller.signal);
+          failures = 0;
+        } catch (e) {
+          if (isPredictCancelError(e, controller.signal.aborted)) throw e;
+          if (!(e instanceof TypeError)) throw e;
+          // Connection error: retry a few times, then report why Python stopped if we know.
+          failures += 1;
+          if (failures >= JOB_POLL_RETRIES) {
+            const message = await waitForSidecarFailure();
+            throw new Error(message || `Lost contact with the sidecar after ${stream.frames.length} of ${stream.total} frames.`);
+          }
+          await pollDelay(JOB_POLL_MS * 2, controller.signal);
+          continue;
+        }
+        if (activeStream !== stream) return;
+        if (applyJobSnapshot(stream, data)) flushStream(stream);
+        switch (data.status) {
+          case 'done':
+            stream.meta = { ...stream.meta, latency_ms: data.latency_ms };
+            if (stream.frames.length < (data.done ?? 0)) continue; // more frames than one poll returned
+            flushStream(stream);
+            return;
+          case 'cancelled':
+            throw new Error('Prediction cancelled');
+          case 'error':
+            throw new Error(data.error || 'Prediction failed');
+          default:
+            break;
+        }
+        await pollDelay(JOB_POLL_MS, controller.signal);
+      }
+    } catch (e) {
+      if (isPredictCancelError(e, controller.signal.aborted)) await collectLastJobFrames(stream);
+      throw e;
+    }
+  }
+
   async function runPredict() {
     if (loading) return;
     if (installing) {
@@ -768,9 +1068,14 @@
     error = null;
     result = null;
     clientMs = null;
+    streamDone = 0;
+    streamTotal = 0;
+    followLatest = true;
+    resultIndex = 0;
     const controller = new AbortController();
     predictAbort = controller;
     const t0 = performance.now();
+    let stream = null;
     try {
       let body;
       try {
@@ -782,47 +1087,49 @@
         throw new Error('Payload needs symbols[] and positions[][]');
       }
       const predictAll = allFrames && frameCount > 1 && sourceText;
-      const res = await sidecarFetch(predictAll ? `${SIDECAR_BASE}/predict-frames` : `${SIDECAR_BASE}/predict`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify(predictAll
-          ? { filename: structureName || 'trajectory.xyz', text: sourceText, device: deviceChoice, engine: engineChoice, model_path: modelPath.trim() || null, head: heads.length > 1 ? headChoice : null }
-          : { ...body, device: deviceChoice, engine: engineChoice, model_path: modelPath.trim() || null, head: heads.length > 1 ? headChoice : null }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const detail = data.detail || data.message || `HTTP ${res.status}`;
-        if (res.status === 409 || /prediction cancelled/i.test(String(detail))) {
+      const settings = { device: deviceChoice, engine: engineChoice, model_path: modelPath.trim() || null, head: heads.length > 1 ? headChoice : null };
+      if (predictAll) {
+        stream = { frames: [], total: frameCount, device: deviceChoice, meta: {}, timer: null, jobId: null };
+        activeStream = stream;
+        streamTotal = frameCount;
+        await runFrameJob(stream, controller, { filename: structureName || 'trajectory.xyz', text: sourceText, ...settings });
+      } else {
+        const res = await sidecarFetch(`${SIDECAR_BASE}/predict`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({ ...body, ...settings }),
+        });
+        if (!res.ok) throw await predictErrorFrom(res);
+        const data = await res.json().catch(() => ({}));
+        if (controller.signal.aborted) {
           throw new Error('Prediction cancelled');
         }
-        throw new Error(detail);
-      }
-      if (controller.signal.aborted) {
-        throw new Error('Prediction cancelled');
-      }
-      if (predictAll) {
-        const first = data.frames?.[0];
-        if (!first) throw new Error('No frames came back.');
-        result = { ...data, energy: first.energy, forces: first.forces, n_atoms: first.n_atoms };
-        if (structureFrames.length) selectInputFrame(0);
-        else shownFrame = 0;
-      } else {
         result = data;
       }
       clientMs = performance.now() - t0;
     } catch (e) {
+      if (stream) flushStream(stream);
+      const kept = stream ? stream.frames.length : 0;
       if (isPredictCancelError(e, controller.signal.aborted)) {
-        cancelledNote = 'Prediction cancelled.';
+        cancelledNote = kept
+          ? `Prediction cancelled after ${kept} of ${stream.total} frames. Results keep the finished frames.`
+          : 'Prediction cancelled.';
         error = null;
-        result = null;
+        if (!kept) result = null;
       } else {
-        error = e.message || String(e);
+        const message = e.message || String(e);
+        error = kept ? `${message} Results keep the ${kept} frames that finished.` : message;
+        if (!kept) result = null;
       }
     } finally {
+      if (stream?.timer) clearTimeout(stream.timer);
+      if (activeStream === stream) activeStream = null;
       if (predictAbort === controller) predictAbort = null;
       loading = false;
       predictCancelling = false;
+      // Point the structure viewer at the result frame now shown (it is not reloaded per frame).
+      if (stream && result?.frames?.length) showFrame(Math.min(resultIndex, result.frames.length - 1));
     }
   }
   if (keptHeads) applyHeads(keptHeads.found, keptHeads.selected);
@@ -839,7 +1146,7 @@
       <div class="relative space-y-2">
         {#if loading}
           <button type="button" class="w-full px-4 py-2.5 rounded-lg text-sm font-semibold bg-brand-600 text-white disabled:opacity-50" disabled>
-            Predicting…
+            Predicting…{streamTotal > 1 ? ` ${streamDone} / ${streamTotal}` : ''}
           </button>
           <button type="button" class="w-full px-4 py-2.5 rounded-lg text-sm font-semibold border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-50" onclick={cancelPredict} disabled={predictCancelling}>
             {predictCancelling ? 'Cancelling…' : 'Cancel'}
@@ -1037,8 +1344,21 @@
           {#if loading}<span class="text-xs font-medium text-brand-600">{predictCancelling ? 'Cancelling…' : 'Running…'}</span>{/if}
         </div>
       </div>
+      {#if loading && streamTotal > 1}
+        <div class="mb-3" role="status" aria-live="polite">
+          <div class="flex items-center justify-between text-xs mb-1">
+            <span class="font-semibold text-brand-700">{streamDone ? `Frame ${streamDone} of ${streamTotal}` : `Starting… 0 of ${streamTotal} frames`}</span>
+            <span class="font-mono text-slate-500">{Math.floor((streamDone / streamTotal) * 100)}%</span>
+          </div>
+          <div class="h-1.5 w-full overflow-hidden rounded-full bg-slate-200" role="progressbar" aria-valuemin="0" aria-valuemax={streamTotal} aria-valuenow={streamDone}>
+            <div class="h-full rounded-full bg-brand-600 transition-[width] duration-150" style="width: {Math.min(100, (streamDone / streamTotal) * 100)}%"></div>
+          </div>
+        </div>
+      {/if}
       {#if !result && !loading}
         <p class="text-sm text-slate-500">{cancelledNote || 'Energy and forces show up here after you run predict.'}</p>
+      {:else if !result}
+        <p class="text-sm text-slate-500">{streamTotal > 1 ? 'Loading the model. Results appear as each frame finishes.' : 'Running predict…'}</p>
       {:else if result}
         <div class="flex flex-wrap items-start gap-3 mb-3">
           <div class="min-w-[260px] max-w-3xl flex-1 rounded-xl border border-slate-200 border-l-4 border-blue-500 bg-white p-2 shadow-sm">
@@ -1081,11 +1401,20 @@
         {:else if openStat === 'latency'}
           <p class="text-xs text-slate-600 mb-2">Server {result.latency_ms?.toFixed?.(1) ?? result.latency_ms} ms{#if clientMs != null} · round trip {clientMs.toFixed(1)} ms{/if}</p>
         {/if}
-        {#if result.frames?.length > 1}
-          <div class="flex items-center gap-2 mb-2 text-xs text-slate-600">
-            <button class="px-3 py-1 rounded-lg text-xs font-semibold bg-brand-50 text-brand-600 disabled:opacity-40" onclick={() => showFrame(shownFrame - 1)} disabled={shownFrame === 0}>Previous</button>
-            <span>Frame {shownFrame + 1} of {result.frames.length}</span>
-            <button class="px-3 py-1 rounded-lg text-xs font-semibold bg-brand-50 text-brand-600 disabled:opacity-40" onclick={() => showFrame(shownFrame + 1)} disabled={shownFrame >= result.frames.length - 1}>Next</button>
+        {#if result.frames?.length > 1 || (loading && result.frames?.length)}
+          <div class="flex flex-wrap items-center gap-2 mb-2 text-xs text-slate-600">
+            <button class="px-3 py-1 rounded-lg text-xs font-semibold bg-brand-50 text-brand-600 disabled:opacity-40" onclick={() => showFrame(resultIndex - 1)} disabled={resultIndex === 0}>Previous</button>
+            <span>Frame {resultIndex + 1} of {loading ? streamTotal : result.frames.length}</span>
+            <button class="px-3 py-1 rounded-lg text-xs font-semibold bg-brand-50 text-brand-600 disabled:opacity-40" onclick={() => showFrame(resultIndex + 1)} disabled={resultIndex >= result.frames.length - 1}>Next</button>
+            {#if loading}
+              {#if followLatest}
+                <span class="text-brand-600">Showing the latest finished frame</span>
+              {:else}
+                <button class="px-3 py-1 rounded-lg text-xs font-semibold bg-brand-600 text-white hover:bg-brand-700" onclick={jumpToLatest}>Follow latest</button>
+              {/if}
+            {:else if result.frames.length < frameCount}
+              <span class="text-amber-700">{frameCount - result.frames.length} frames were not predicted.</span>
+            {/if}
           </div>
         {:else if frameCount > 1}
           <p class="text-xs text-slate-500 mb-2">Frame {shownFrame + 1} of {frameCount}. The other frames were not predicted.</p>
