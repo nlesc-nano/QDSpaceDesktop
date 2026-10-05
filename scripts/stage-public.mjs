@@ -10,6 +10,8 @@ for (const name of ["library_index.json", "metadata.json", "file_list.json", "vi
 }
 const assets = resolve("public", "assets");
 if (existsSync(assets)) cpSync(assets, resolve(dest, "assets"), { recursive: true });
+const predict = resolve("public", "predict");
+if (existsSync(predict)) cpSync(predict, resolve(dest, "predict"), { recursive: true });
 for (const family of ["ABX3", "II-VI", "III-V", "IV-VI"]) {
   const src = resolve("public", family, "bulk_cifs");
   if (!existsSync(src)) continue;
@@ -17,4 +19,4 @@ for (const family of ["ABX3", "II-VI", "III-V", "IV-VI"]) {
   mkdirSync(out, { recursive: true });
   cpSync(src, out, { recursive: true });
 }
-console.log("staged catalog and builder CIF templates into public-release");
+console.log("staged catalog, builder CIF templates, and predict samples into public-release");

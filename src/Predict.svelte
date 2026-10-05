@@ -87,6 +87,49 @@
     return String(e || 'Unknown error');
   }
 
+  function sampleBodyIsHtml(text) {
+    const start = String(text || '').trimStart().slice(0, 64).toLowerCase();
+    return start.startsWith('<!doctype') || start.startsWith('<html');
+  }
+
+  async function takeSidecarFailure() {
+    try {
+      const internals = typeof window !== 'undefined' ? window.__TAURI_INTERNALS__ : null;
+      if (!internals?.invoke) return null;
+      const message = await internals.invoke('take_sidecar_failure');
+      if (typeof message === 'string' && message.trim()) {
+        userPythonOn = false;
+        pythonNote = '';
+        return message.trim();
+      }
+    } catch {
+      /* not in the desktop app */
+    }
+    return null;
+  }
+
+  async function waitForSidecarFailure() {
+    if (!userPythonOn) return null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const message = await takeSidecarFailure();
+      if (message) return message;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return null;
+  }
+
+  async function sidecarFetch(url, options) {
+    const pending = await takeSidecarFailure();
+    if (pending) throw new Error(pending);
+    try {
+      return await fetch(url, options);
+    } catch (e) {
+      const message = await waitForSidecarFailure();
+      if (message) throw new Error(message);
+      throw e;
+    }
+  }
+
   async function browsePython() {
     const picked = await tauriInvoke('pick_python_path');
     if (typeof picked === 'string' && picked.trim()) pythonPath = picked.trim();
@@ -104,6 +147,31 @@
 
   function missingLabel(name) {
     return name === 'mace' ? 'mace-torch' : name;
+  }
+
+  function pinChangeMessage(change) {
+    if (change?.message && typeof change.message === 'string') return change.message;
+    const name = change?.name || 'package';
+    const required = change?.required || '';
+    if (change?.current) {
+      return `MACE in this app needs ${name} ${required}; yours is ${change.current}. Install will change it to ${required}.`;
+    }
+    return `MACE in this app needs ${name} ${required}; it is not installed. Install will set it to ${required}.`;
+  }
+
+  function installPackagesFromPrompt(pending) {
+    const missing = Array.isArray(pending?.missing) ? pending.missing.slice() : [];
+    const pins = Array.isArray(pending?.pinChanges)
+      ? pending.pinChanges.map((change) => change?.name).filter((name) => typeof name === 'string' && name.trim())
+      : [];
+    const seen = new Set();
+    const packages = [];
+    for (const name of [...missing, ...pins]) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      packages.push(name);
+    }
+    return packages;
   }
 
   async function finishUserPython(python, packages) {
@@ -189,7 +257,7 @@
     pythonBusyLabel = 'Installing…';
     const watch = watchInstall(gen);
     try {
-      await finishUserPython(pending.python, pending.missing.slice());
+      await finishUserPython(pending.python, installPackagesFromPrompt(pending));
     } catch (e) {
       if (!isCancelError(e)) {
         userPythonOn = false;
@@ -221,10 +289,13 @@
       const missing = Array.isArray(info?.missing)
         ? info.missing.filter((name) => typeof name === 'string' && name.trim())
         : [];
+      const pinChanges = Array.isArray(info?.pinChanges)
+        ? info.pinChanges.filter((change) => change && typeof change === 'object')
+        : [];
       const python = info?.python || pythonPath.trim();
       if (info?.python) pythonPath = info.python;
-      if (missing.length) {
-        installPrompt = { python, missing };
+      if (missing.length || pinChanges.length) {
+        installPrompt = { python, missing, pinChanges };
         return;
       }
       pythonBusyLabel = 'Starting…';
@@ -257,7 +328,7 @@
     }
     try {
       const query = modelPath ? `?model_path=${encodeURIComponent(modelPath)}` : '';
-      const res = await fetch(`${SIDECAR_BASE}/heads${query}`);
+      const res = await sidecarFetch(`${SIDECAR_BASE}/heads${query}`);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       applyHeads(data.heads, data.selected);
@@ -266,13 +337,14 @@
         selected: data.selected || '',
       };
     } catch (e) {
-      if (!reportError) {
+      const message = e.message || String(e);
+      if (!reportError && !message.startsWith('Your Python stopped')) {
         if (keptHeads) applyHeads(keptHeads.found, keptHeads.selected);
         return;
       }
       keptHeads = null;
       applyHeads([], '');
-      error = e.message || String(e);
+      error = message;
     }
   }
 
@@ -458,8 +530,11 @@
     error = null;
     try {
       const res = await fetch(`/predict/${encodeURIComponent(sample.file)}`);
-      if (!res.ok) throw new Error(`Could not load ${sample.name} (${res.status})`);
       const text = await res.text();
+      if (sampleBodyIsHtml(text, res.headers.get('content-type'))) {
+        throw new Error(`sample file missing (${sample.name})`);
+      }
+      if (!res.ok) throw new Error(`Could not load ${sample.name} (${res.status})`);
       const file = new File([text], sample.file, { type: 'chemical/x-xyz' });
       await loadStructureFile(file);
     } catch (e) {
@@ -568,7 +643,7 @@
     }
     try {
       const text = await file.text();
-      const res = await fetch(`${SIDECAR_BASE}/structure`, {
+      const res = await sidecarFetch(`${SIDECAR_BASE}/structure`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filename: file.name, text }),
@@ -620,7 +695,7 @@
     if (!file) return;
     error = null;
     try {
-      const res = await fetch(`${SIDECAR_BASE}/model?filename=${encodeURIComponent(file.name)}`, {
+      const res = await sidecarFetch(`${SIDECAR_BASE}/model?filename=${encodeURIComponent(file.name)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: await file.arrayBuffer(),
@@ -679,7 +754,7 @@
         throw new Error('Payload needs symbols[] and positions[][]');
       }
       const predictAll = allFrames && frameCount > 1 && sourceText;
-      const res = await fetch(predictAll ? `${SIDECAR_BASE}/predict-frames` : `${SIDECAR_BASE}/predict`, {
+      const res = await sidecarFetch(predictAll ? `${SIDECAR_BASE}/predict-frames` : `${SIDECAR_BASE}/predict`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(predictAll
@@ -980,11 +1055,20 @@
   <div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-6">
     <div class="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-xl" role="dialog" aria-modal="true" aria-labelledby="install-python-title">
       <h2 id="install-python-title" class="font-heading text-lg font-bold text-slate-900">Install these into this Python?</h2>
-      <ul class="mt-3 list-disc space-y-1 pl-5 text-sm text-slate-800">
-        {#each installPrompt.missing as name}
-          <li class="font-mono">{missingLabel(name)}</li>
-        {/each}
-      </ul>
+      {#if installPrompt.missing?.length}
+        <ul class="mt-3 list-disc space-y-1 pl-5 text-sm text-slate-800">
+          {#each installPrompt.missing as name}
+            <li class="font-mono">{missingLabel(name)}</li>
+          {/each}
+        </ul>
+      {/if}
+      {#if installPrompt.pinChanges?.length}
+        <div class="mt-3 space-y-2" role="status">
+          {#each installPrompt.pinChanges as change}
+            <p class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">{pinChangeMessage(change)}</p>
+          {/each}
+        </div>
+      {/if}
       <p class="mt-3 break-all text-xs text-slate-500">{installPrompt.python}</p>
       <div class="mt-5 flex justify-end gap-2">
         <button type="button" class="rounded-lg border border-red-200 px-4 py-2 text-sm font-semibold text-red-600 hover:bg-red-50" onclick={cancelInstall}>Cancel</button>

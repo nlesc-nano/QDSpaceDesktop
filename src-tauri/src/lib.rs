@@ -13,11 +13,26 @@ struct UserPythonInfo {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PinChange {
+  /// Import / distribution name, e.g. e3nn.
+  name: String,
+  /// Exact version required by the packed MACE runtime.
+  required: String,
+  /// Version currently installed, if any.
+  current: Option<String>,
+  /// Human-readable warning for the install dialog.
+  message: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PythonCheck {
   python: String,
   device: String,
   torch: String,
   missing: Vec<String>,
+  /// Pinned MACE companions that would be installed or changed (e.g. e3nn 0.6.0 → 0.4.4).
+  pin_changes: Vec<PinChange>,
 }
 
 #[derive(serde::Deserialize)]
@@ -33,7 +48,7 @@ struct Probe {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
-    .invoke_handler(tauri::generate_handler![pick_python_path, check_user_python, apply_user_python, cancel_python_install, python_install_status])
+    .invoke_handler(tauri::generate_handler![pick_python_path, check_user_python, apply_user_python, cancel_python_install, python_install_status, take_sidecar_failure])
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -121,7 +136,7 @@ fn developer_sidecar_python() -> std::path::PathBuf {
     .join("python.exe")
 }
 
-fn spawn_uvicorn(python: &std::path::Path, cwd: &std::path::Path) {
+fn spawn_uvicorn(python: &std::path::Path, cwd: &std::path::Path, bundled: bool) {
   let mut cmd = std::process::Command::new(python);
   cmd
     .args(["-m", "uvicorn", "sidecar_app:app", "--host", "127.0.0.1", "--port", "8765"])
@@ -129,6 +144,11 @@ fn spawn_uvicorn(python: &std::path::Path, cwd: &std::path::Path) {
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::null());
+  // Packed Windows Python does not search Lib\site-packages\torch\lib unless PATH
+  // includes it. with_python_env already adds that directory for a user interpreter.
+  if bundled {
+    with_python_env(&mut cmd, python);
+  }
   hidden(&mut cmd);
   match cmd.spawn() {
     Ok(child) => {
@@ -142,7 +162,7 @@ fn start_developer_services(root: &std::path::Path) {
   if !listening(SIDECAR_PORT) {
     let python = developer_sidecar_python();
     if python.is_file() {
-      spawn_uvicorn(&python, &root.join("sidecar"));
+      spawn_uvicorn(&python, &root.join("sidecar"), false);
     } else {
       eprintln!("sidecar Python was not found at {}", python.display());
     }
@@ -178,7 +198,7 @@ fn start_local_services(app: &tauri::AppHandle) {
   }
   if let Some(runtime) = bundled_runtime(app) {
     if let Some(python) = bundled_python(&runtime) {
-      spawn_uvicorn(&python, &runtime.join("app"));
+      spawn_uvicorn(&python, &runtime.join("app"), true);
     }
   }
 }
@@ -190,13 +210,13 @@ fn restart_default_sidecar(app: &tauri::AppHandle) {
   if let Some(root) = project_root() {
     let python = developer_sidecar_python();
     if python.is_file() {
-      spawn_uvicorn(&python, &root.join("sidecar"));
+      spawn_uvicorn(&python, &root.join("sidecar"), false);
       return;
     }
   }
   if let Some(runtime) = bundled_runtime(app) {
     if let Some(python) = bundled_python(&runtime) {
-      spawn_uvicorn(&python, &runtime.join("app"));
+      spawn_uvicorn(&python, &runtime.join("app"), true);
     }
   }
 }
@@ -689,7 +709,7 @@ try:
     out["mps"] = bool(mps is not None and mps.is_available())
 except Exception:
     out["mps"] = False
-for name in ("torchvision", "torchaudio"):
+for name in ("torchvision", "torchaudio", "e3nn"):
     try:
         mod = __import__(name)
         version = getattr(mod, "__version__", None)
@@ -733,6 +753,79 @@ fn pip_spec(import_name: &str) -> Option<&'static str> {
     "ase" => Some("ase>=3.22"),
     _ => None,
   }
+}
+
+/// Exact pins matching scripts/build-mace-runtime.mjs (packed mace-runtime).
+/// mace-torch is installed with --no-deps, so these must be installed explicitly.
+fn companion_pins() -> &'static [(&'static str, &'static str)] {
+  &[("e3nn", "0.4.4")]
+}
+
+fn companion_pin_version(module: &str) -> Option<&'static str> {
+  companion_pins()
+    .iter()
+    .find(|(name, _)| *name == module)
+    .map(|(_, version)| *version)
+}
+
+fn normalize_pin_version(version: &str) -> &str {
+  version.split('+').next().unwrap_or(version).trim()
+}
+
+fn pin_satisfied(probe: &Probe, name: &str, required: &str) -> bool {
+  probe
+    .pins
+    .get(name)
+    .map(|current| normalize_pin_version(current) == required)
+    .unwrap_or(false)
+}
+
+fn pin_change_for(name: &str, required: &str, current: Option<&str>) -> PinChange {
+  let message = match current {
+    Some(cur) => format!(
+      "MACE in this app needs {name} {required}; yours is {cur}. Install will change it to {required}."
+    ),
+    None => format!(
+      "MACE in this app needs {name} {required}; it is not installed. Install will set it to {required}."
+    ),
+  };
+  PinChange {
+    name: name.into(),
+    required: required.into(),
+    current: current.map(|value| value.to_string()),
+    message,
+  }
+}
+
+fn pin_changes(probe: &Probe) -> Vec<PinChange> {
+  companion_pins()
+    .iter()
+    .filter_map(|(name, required)| {
+      if pin_satisfied(probe, name, required) {
+        return None;
+      }
+      let current = probe.pins.get(*name).map(|value| normalize_pin_version(value));
+      Some(pin_change_for(name, required, current))
+    })
+    .collect()
+}
+
+fn install_companion_pins(python: &std::path::Path) -> Result<(), String> {
+  let probe = probe_python(python)?;
+  let mut specs: Vec<String> = Vec::new();
+  for (name, version) in companion_pins() {
+    if pin_satisfied(&probe, name, version) {
+      continue;
+    }
+    let spec = format!("{name}=={version}");
+    assert_not_torch(&spec)?;
+    specs.push(spec);
+  }
+  if specs.is_empty() {
+    return Ok(());
+  }
+  // Install with deps: e3nn needs opt_einsum and friends. Never torch.
+  pip_install(python, &specs, false)
 }
 
 fn assert_not_torch(spec: &str) -> Result<(), String> {
@@ -890,12 +983,18 @@ sys.exit(0)
       return Err(format!("pip could not provide {module} for mace-torch. Torch was not changed."));
     }
     seen.push(module.clone());
-    let package = map_distribution(&module);
+    let dist = map_distribution(&module);
+    let package = match companion_pin_version(&module) {
+      Some(version) => format!("{dist}=={version}"),
+      None => dist,
+    };
     assert_not_torch(&package)?;
     if install_cancelled() {
       return Err(INSTALL_CANCELLED.into());
     }
-    pip_install(python, &[package], true)?;
+    // Companions with exact pins install with deps; other fill-ins stay --no-deps.
+    let no_deps = companion_pin_version(&module).is_none();
+    pip_install(python, &[package], no_deps)?;
   }
   Err("mace-torch still has missing dependencies. Torch was not changed.".into())
 }
@@ -946,10 +1045,12 @@ fn check_user_python_impl(app: &tauri::AppHandle, python_path: &str) -> Result<P
     device: device_label(&probe).into(),
     torch,
     missing: required_missing(&probe),
+    pin_changes: pin_changes(&probe),
   })
 }
 
-/// Installs only names the user confirmed that are still missing. Never installs torch.
+/// Installs only names the user confirmed that are still missing, plus pinned MACE companions
+/// (e.g. e3nn==0.4.4). Never installs torch. mace-torch still uses --no-deps.
 /// Returns whether mace-torch was installed by this call, plus a fresh probe.
 fn install_confirmed(python: &std::path::Path, requested: &[String]) -> Result<(Probe, bool), String> {
   if install_cancelled() {
@@ -964,6 +1065,7 @@ fn install_confirmed(python: &std::path::Path, requested: &[String]) -> Result<(
   let mut seen = std::collections::BTreeSet::new();
   let mut specs: Vec<String> = Vec::new();
   let mut install_mace = false;
+  let mut install_pins = false;
   for name in requested {
     let name = name.trim();
     if name.is_empty() || !seen.insert(name.to_string()) {
@@ -971,6 +1073,11 @@ fn install_confirmed(python: &std::path::Path, requested: &[String]) -> Result<(
     }
     if name == "torch" || name == "torchvision" || name == "torchaudio" {
       return Err("Refusing to install or upgrade torch.".into());
+    }
+    if companion_pin_version(name).is_some() {
+      // e3nn (and other packed-runtime pins): install/change even when import already works.
+      install_pins = true;
+      continue;
     }
     if pip_spec(name).is_none() {
       return Err(format!("This app will not install {name}."));
@@ -980,6 +1087,8 @@ fn install_confirmed(python: &std::path::Path, requested: &[String]) -> Result<(
     }
     if name == "mace" {
       install_mace = true;
+      // mace-torch is --no-deps; always enforce companion pins alongside it.
+      install_pins = true;
       continue;
     }
     let spec = pip_spec(name).unwrap();
@@ -1002,13 +1111,24 @@ fn install_confirmed(python: &std::path::Path, requested: &[String]) -> Result<(
     if install_cancelled() {
       return Err(INSTALL_CANCELLED.into());
     }
+    // Pin e3nn before fill_mace_deps so a newer env e3nn is downgraded, not left in place.
+    install_companion_pins(python)?;
+    if install_cancelled() {
+      return Err(INSTALL_CANCELLED.into());
+    }
     fill_mace_deps(python)?;
+  } else if install_pins {
+    if install_cancelled() {
+      return Err(INSTALL_CANCELLED.into());
+    }
+    install_companion_pins(python)?;
   }
   if install_cancelled() {
     return Err(INSTALL_CANCELLED.into());
   }
 
-  let probe = if specs.is_empty() && !install_mace { first } else { probe_python(python)? };
+  let did_work = !specs.is_empty() || install_mace || install_pins;
+  let probe = if did_work { probe_python(python)? } else { first };
   let after = probe.torch.clone().unwrap_or_default();
   if after != before {
     return Err(format!(
@@ -1022,16 +1142,29 @@ fn install_confirmed(python: &std::path::Path, requested: &[String]) -> Result<(
       still.join(", ")
     ));
   }
+  let still_pins = pin_changes(&probe);
+  if !still_pins.is_empty() {
+    let detail = still_pins
+      .iter()
+      .map(|change| change.message.as_str())
+      .collect::<Vec<_>>()
+      .join(" ");
+    return Err(format!(
+      "Pinned MACE companions are still wrong ({detail}). Torch was not changed."
+    ));
+  }
   Ok((probe, install_mace))
 }
 
 fn switch_user_sidecar(app: &tauri::AppHandle, python: &std::path::Path, python_path: String, probe: &Probe, installed_mace: bool) -> Result<UserPythonInfo, String> {
   let torch = probe.torch.clone().unwrap_or_default();
   let workdir = sidecar_workdir(app)?;
+  // Disarm the previous watcher before the kill, so that exit is not treated as a crash.
+  bump_sidecar_generation();
   if let Err(err) = stop_port(SIDECAR_PORT) {
     return Err(err);
   }
-  if let Err(err) = start_user_sidecar(python, &workdir) {
+  if let Err(err) = start_user_sidecar(app, python, &workdir) {
     restart_default_sidecar(app);
     return Err(err);
   }
@@ -1182,7 +1315,67 @@ fn log_tail(path: &std::path::Path) -> String {
   }
 }
 
-fn start_user_sidecar(python: &std::path::Path, cwd: &std::path::Path) -> Result<(), String> {
+struct SidecarWatch {
+  generation: u64,
+  failure: Option<String>,
+}
+
+static SIDECAR_WATCH: std::sync::Mutex<SidecarWatch> = std::sync::Mutex::new(SidecarWatch {
+  generation: 0,
+  failure: None,
+});
+
+static ENSURE_SERVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn sidecar_watch_lock() -> std::sync::MutexGuard<'static, SidecarWatch> {
+  SIDECAR_WATCH.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn bump_sidecar_generation() -> u64 {
+  let mut gate = sidecar_watch_lock();
+  gate.generation = gate.generation.wrapping_add(1);
+  gate.failure = None;
+  gate.generation
+}
+
+fn ensure_predict_server(app: &tauri::AppHandle) {
+  let _hold = ENSURE_SERVER.lock().unwrap_or_else(|err| err.into_inner());
+  for _ in 0..20 {
+    if !listening(SIDECAR_PORT) {
+      break;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+  }
+  if !listening(SIDECAR_PORT) {
+    restart_default_sidecar(app);
+  }
+}
+
+fn watch_user_sidecar(app: tauri::AppHandle, mut child: std::process::Child, generation: u64, log_path: std::path::PathBuf) {
+  let status = child.wait();
+  let status_text = match status {
+    Ok(status) => status.to_string(),
+    Err(err) => err.to_string(),
+  };
+  let message = format!("Your Python stopped ({status_text}). {}", log_tail(&log_path));
+  {
+    let mut gate = sidecar_watch_lock();
+    if gate.generation != generation {
+      return;
+    }
+    gate.failure = Some(message);
+  }
+  ensure_predict_server(&app);
+}
+
+/// Last lines from a user Python that exited after a successful switch.
+/// The watcher starts the bundled runtime again when it records that exit.
+#[tauri::command]
+fn take_sidecar_failure() -> Option<String> {
+  sidecar_watch_lock().failure.take()
+}
+
+fn start_user_sidecar(app: &tauri::AppHandle, python: &std::path::Path, cwd: &std::path::Path) -> Result<(), String> {
   let log_path = std::env::temp_dir().join("qdspace-user-python-sidecar.log");
   let log_file = std::fs::File::create(&log_path).map_err(|err| format!("Could not log the sidecar: {err}"))?;
   let stdout = log_file.try_clone().map_err(|err| format!("Could not log the sidecar: {err}"))?;
@@ -1203,12 +1396,15 @@ fn start_user_sidecar(python: &std::path::Path, cwd: &std::path::Path) -> Result
     _ => sidecar_dir,
   };
   cmd.env("PYTHONPATH", pythonpath);
+  cmd.env("PYTHONUNBUFFERED", "1");
   hidden(&mut cmd);
+  let generation = bump_sidecar_generation();
   let mut child = cmd.spawn().map_err(|err| format!("Could not start the sidecar with this Python: {err}"))?;
+  let mut opened = false;
   for _ in 0..180 {
     if listening(SIDECAR_PORT) {
-      std::mem::forget(child);
-      return Ok(());
+      opened = true;
+      break;
     }
     match child.try_wait() {
       Ok(Some(status)) => {
@@ -1221,6 +1417,12 @@ fn start_user_sidecar(python: &std::path::Path, cwd: &std::path::Path) -> Result
       Err(err) => return Err(format!("Could not check the sidecar: {err}")),
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
+  }
+  if opened {
+    let app = app.clone();
+    let log_path = log_path.clone();
+    std::thread::spawn(move || watch_user_sidecar(app, child, generation, log_path));
+    return Ok(());
   }
   let _ = child.kill();
   let _ = child.wait();
