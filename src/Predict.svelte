@@ -8,6 +8,7 @@
   import { SIDECAR_BASE } from './lib/desktop.js';
   import Viewer from './Viewer.svelte';
   import PredictTrajectory from './PredictTrajectory.svelte';
+  import ModelPicker from './ModelPicker.svelte';
   import {
     clampFrameNumber,
     rangeIndices,
@@ -129,6 +130,8 @@
     engineChoice = name;
     modelPath = '';
     modelName = '';
+    modelType = null;
+    modelNote = '';
     applyHeads([], '');
     if (name === 'mace') refreshHeads();
   }
@@ -136,6 +139,10 @@
   let modelPath = $state('');
   let modelName = $state('');
   let modelInput = $state(null);
+  let modelType = $state(null);
+  let modelNote = $state('');
+  let showModelPicker = $state(false);
+  let maceTorchVersion = $state(null);
   let pythonPath = $state('');
   let pythonBusy = $state(false);
   let pythonBusyLabel = $state('Checking…');
@@ -828,6 +835,8 @@
       if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       modelPath = data.model_path;
       modelName = data.filename;
+      modelType = null;
+      modelNote = '';
       if (engineChoice === 'mace') applyHeads(data.heads, data.selected);
       else applyHeads([], '');
     } catch (e) {
@@ -849,11 +858,69 @@
   function useBuiltInModel() {
     modelPath = '';
     modelName = '';
+    modelType = null;
+    modelNote = '';
     refreshHeads();
   }
 
   function clearModelFile() {
     useBuiltInModel();
+  }
+
+  async function loadModelByPath(absPath, opts = {}) {
+    if (!absPath) return;
+    error = null;
+    try {
+      const res = await sidecarFetch(`${SIDECAR_BASE}/model-path`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: absPath, model_type: opts.model_type || null }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      modelPath = data.model_path;
+      modelName = data.filename || absPath.split(/[/\\]/).pop();
+      modelType = opts.model_type || data.model_type || null;
+      modelNote = opts.note || '';
+      if (engineChoice === 'mace') applyHeads(data.heads, data.selected);
+      else applyHeads([], '');
+    } catch (e) {
+      error = e.message || String(e);
+    }
+  }
+
+  async function onBrowseModelPath() {
+    error = null;
+    try {
+      const picked = await tauriInvoke('pick_model_path');
+      if (typeof picked === 'string' && picked.trim()) {
+        await loadModelByPath(picked.trim());
+      }
+    } catch (e) {
+      error = invokeError(e);
+    }
+  }
+
+  async function openFoundationPicker() {
+    error = null;
+    showModelPicker = true;
+    try {
+      const res = await sidecarFetch(`${SIDECAR_BASE}/health`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.mace_torch) maceTorchVersion = data.mace_torch;
+    } catch {
+      /* health optional for picker */
+    }
+  }
+
+  function onFoundationLoaded(info) {
+    const note = info?.needsChargeSpin
+      ? `${info.name || 'Model'} may need charge/spin on the structure (defaults charge 0 / spin 1 if unsupported).`
+      : '';
+    loadModelByPath(info.model_path, {
+      model_type: info.model_type || null,
+      note,
+    });
   }
 
   function isPredictCancelError(e, aborted) {
@@ -1202,7 +1269,7 @@
         throw new Error('Payload needs symbols[] and positions[][]');
       }
       const multi = frameCount > 1 && sourceText;
-      const settings = { device: deviceChoice, engine: engineChoice, model_path: modelPath.trim() || null, head: heads.length > 1 ? headChoice : null };
+      const settings = { device: deviceChoice, engine: engineChoice, model_path: modelPath.trim() || null, head: heads.length > 1 ? headChoice : null, model_type: modelType || null };
       if (multi && (predictMode === 'all' || predictMode === 'range')) {
         let text = sourceText;
         let indexMap = null;
@@ -1416,7 +1483,18 @@
             {/if}
           </div>
         </label>
-        <button type="button" class="w-full mt-2 rounded-lg py-1.5 text-xs font-bold transition-all {!modelName ? 'bg-white text-brand-600 shadow-sm' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}" onclick={useBuiltInModel}>Use built-in model</button>
+        <div class="mt-2 grid grid-cols-1 gap-2">
+          <button type="button" class="w-full rounded-lg py-1.5 text-xs font-bold transition-all {!modelName ? 'bg-white text-brand-600 shadow-sm' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}" onclick={useBuiltInModel}>Use built-in model</button>
+          {#if engineChoice === 'mace'}
+            <button type="button" class="w-full rounded-lg border border-brand-200 bg-brand-50 py-1.5 text-xs font-bold text-brand-700 hover:bg-brand-100" onclick={openFoundationPicker}>Download foundation model…</button>
+          {/if}
+        </div>
+        {#if modelNote}
+          <p class="mt-2 text-[11px] text-amber-800">{modelNote}</p>
+        {/if}
+        {#if modelType}
+          <p class="mt-1 text-[11px] text-slate-500">model_type: <code class="rounded bg-slate-100 px-1">{modelType}</code></p>
+        {/if}
         {#if engineChoice === 'mace' && heads.length > 1}
           <select class="w-full mt-2 px-3 py-2 rounded-lg text-xs border border-slate-200 bg-white" bind:value={headChoice}>
             {#each heads as head}
@@ -1623,6 +1701,14 @@
     {/if}
   </div>
 {/if}
+
+<ModelPicker
+  bind:open={showModelPicker}
+  {maceTorchVersion}
+  {sidecarFetch}
+  {tauriInvoke}
+  onLoaded={onFoundationLoaded}
+/>
 
 {#if installPrompt}
   <div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-6">

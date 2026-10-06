@@ -62,15 +62,25 @@ def calculator_head(name: Optional[str]) -> Optional[str]:
     return name
 
 
-def cache_key(path: Path, device: str, head: Optional[str] = None) -> tuple:
-    return ("mace", device, str(path.resolve()), head)
+def normalize_model_type(model_type: Optional[str]) -> Optional[str]:
+    if not model_type:
+        return None
+    name = str(model_type).strip()
+    if not name or name.lower() in {"default", "mace", "none"}:
+        return None
+    return name
 
 
-def load(path: Path, device: str, head: Optional[str] = None) -> tuple:
+def cache_key(path: Path, device: str, head: Optional[str] = None, model_type: Optional[str] = None) -> tuple:
+    return ("mace", device, str(path.resolve()), head, normalize_model_type(model_type))
+
+
+def load(path: Path, device: str, head: Optional[str] = None, model_type: Optional[str] = None) -> tuple:
     """Return (calculator, label, load_seconds)."""
     from mace.calculators import MACECalculator
 
     use = calculator_head(head)
+    mtype = normalize_model_type(model_type)
     t0 = time.perf_counter()
     kwargs = {
         "model_paths": str(path),
@@ -79,6 +89,24 @@ def load(path: Path, device: str, head: Optional[str] = None) -> tuple:
     }
     if use:
         kwargs["head"] = use
+    if mtype:
+        kwargs["model_type"] = mtype
     calc = MACECalculator(**kwargs)
     label = path.name if not head or head == "default" else f"{path.name} ({head})"
+    if mtype:
+        label = f"{label} [{mtype}]"
     return calc, label, time.perf_counter() - t0
+
+
+def mace_torch_version() -> Optional[str]:
+    try:
+        import importlib.metadata as md
+
+        return md.version("mace-torch")
+    except Exception:
+        try:
+            import mace
+
+            return getattr(mace, "__version__", None)
+        except Exception:
+            return None

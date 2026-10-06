@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 
 import mace_engine
 import nequip_engine
+import model_download
 
 ROOT = Path(__file__).resolve().parent
 MODEL_PATH = mace_engine.DEFAULT_MODEL
@@ -48,6 +49,8 @@ app.add_middleware(
 _calcs = {}
 _load_s: Optional[float] = None
 _predict_cancel = threading.Event()
+
+_download_mgr = model_download.DownloadManager()
 
 
 class PredictionCancelled(Exception):
@@ -76,6 +79,7 @@ class PredictRequest(BaseModel):
     engine: str = "mace"
     model_path: Optional[str] = None
     head: Optional[str] = None
+    model_type: Optional[str] = None
 
 
 class PredictResponse(BaseModel):
@@ -116,7 +120,7 @@ def resolve_model(engine: str, model_path: Optional[str]) -> Path:
     return MODEL_PATH
 
 
-def get_calculator(device: str = "cpu", engine: str = "mace", model_path: Optional[str] = None, head: Optional[str] = None):
+def get_calculator(device: str = "cpu", engine: str = "mace", model_path: Optional[str] = None, head: Optional[str] = None, model_type: Optional[str] = None):
     global _load_s
     device = (device or "cpu").lower()
     engine = (engine or "mace").lower()
@@ -130,11 +134,19 @@ def get_calculator(device: str = "cpu", engine: str = "mace", model_path: Option
     engine_mod = nequip_engine if engine == "nequip" else mace_engine
     if engine == "mace":
         head = mace_engine.selected_head(mace_engine.read_heads(path), head)
+        model_type = mace_engine.normalize_model_type(model_type)
     else:
         head = None
-    key = engine_mod.cache_key(path, device, head)
+        model_type = None
+    if engine == "mace":
+        key = engine_mod.cache_key(path, device, head, model_type)
+    else:
+        key = engine_mod.cache_key(path, device, head)
     if key not in _calcs:
-        calc, label, load_s = engine_mod.load(path, device, head)
+        if engine == "mace":
+            calc, label, load_s = engine_mod.load(path, device, head, model_type)
+        else:
+            calc, label, load_s = engine_mod.load(path, device, head)
         _calcs[key] = (calc, label)
         _load_s = load_s
     return _calcs[key]
@@ -246,6 +258,79 @@ async def upload_model(request: Request, filename: str = "model.model"):
     return {"model_path": str(dest), "filename": name, "bytes": len(data), "heads": heads, "selected": selected}
 
 
+class ModelPathRequest(BaseModel):
+    path: str = Field(..., min_length=1)
+    model_type: Optional[str] = None
+
+
+@app.post("/model-path")
+def register_model_path(req: ModelPathRequest):
+    """Load a model by absolute path without uploading bytes through POST /model."""
+    path = Path(req.path.strip()).expanduser()
+    if not path.is_file():
+        raise HTTPException(400, f"Model file not found: {path}")
+    if path.stat().st_size < 1024:
+        raise HTTPException(400, "model file looks empty")
+    heads = []
+    selected = None
+    if path.suffix.lower() == ".model" or path.name.lower().endswith(".model"):
+        try:
+            heads = mace_engine.read_heads(path)
+            selected = mace_engine.selected_head(heads)
+        except Exception:
+            heads = []
+            selected = None
+    return {
+        "model_path": str(path.resolve()),
+        "filename": path.name,
+        "bytes": path.stat().st_size,
+        "heads": heads,
+        "selected": selected,
+        "model_type": mace_engine.normalize_model_type(req.model_type),
+    }
+
+
+class DownloadModelRequest(BaseModel):
+    url: str = Field(..., min_length=8)
+    dest_dir: str = Field(..., min_length=1)
+    filename: Optional[str] = None
+    expected_size: Optional[int] = None
+    sha256: Optional[str] = None
+
+
+@app.post("/download-model")
+def download_model(req: DownloadModelRequest):
+    try:
+        job = _download_mgr.start(
+            url=req.url,
+            dest_dir=req.dest_dir,
+            filename=req.filename,
+            expected_size=req.expected_size,
+            sha256=req.sha256,
+        )
+    except model_download.DownloadError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        raise HTTPException(400, str(e)) from e
+    snap = job.snapshot()
+    return {"job_id": snap["id"], "status": snap["status"], "url": snap.get("url")}
+
+
+@app.get("/download-model/{job_id}")
+def download_model_status(job_id: str):
+    job = _download_mgr.get(job_id)
+    if not job:
+        raise HTTPException(404, "Unknown download job")
+    return job.snapshot()
+
+
+@app.post("/cancel-download/{job_id}")
+def cancel_download(job_id: str):
+    if not _download_mgr.cancel(job_id):
+        raise HTTPException(404, "Unknown download job")
+    return {"status": "cancelling", "id": job_id}
+
+
 
 @app.get("/heads")
 def model_heads(model_path: Optional[str] = None):
@@ -255,6 +340,12 @@ def model_heads(model_path: Optional[str] = None):
         return {"heads": heads, "selected": mace_engine.selected_head(heads)}
     except Exception as e:
         raise HTTPException(400, str(e)) from e
+
+
+@app.get("/health")
+def health_get(warmup: bool = False):
+    """GET alias for probes (curl / Invoke-WebRequest without -Method POST)."""
+    return health(warmup=warmup)
 
 
 @app.post("/health")
@@ -267,6 +358,7 @@ def health(warmup: bool = False):
         "gpu_available": gpu_status()[0],
         "gpu_message": gpu_status()[1],
         "model_path": str(MODEL_PATH),
+        "mace_torch": mace_engine.mace_torch_version(),
     }
     if warmup:
         get_calculator(device="cpu", engine="mace")
@@ -299,13 +391,18 @@ def predict(req: PredictRequest):
     path = resolve_model(engine, req.model_path)
     engine_mod = nequip_engine if engine == "nequip" else mace_engine
     head = None
+    model_type = None
     if engine == "mace":
         head = mace_engine.selected_head(mace_engine.read_heads(path), req.head)
-    key = engine_mod.cache_key(path, chosen, head)
+        model_type = mace_engine.normalize_model_type(req.model_type)
+    if engine == "mace":
+        key = engine_mod.cache_key(path, chosen, head, model_type)
+    else:
+        key = engine_mod.cache_key(path, chosen, head)
     first_load = key not in _calcs
     try:
         check_predict_cancel()
-        calc, model_name = get_calculator(chosen, engine, req.model_path, req.head)
+        calc, model_name = get_calculator(chosen, engine, req.model_path, req.head, req.model_type)
         check_predict_cancel()
     except PredictionCancelled:
         raise HTTPException(409, "Prediction cancelled")
@@ -351,6 +448,7 @@ class TrajectoryRequest(BaseModel):
     engine: str = "mace"
     model_path: Optional[str] = None
     head: Optional[str] = None
+    model_type: Optional[str] = None
 
 
 def predict_one_frame(atoms: Atoms, calc) -> dict:
@@ -389,7 +487,7 @@ def predict_frames(req: TrajectoryRequest):
     engine = (req.engine or "mace").lower()
     try:
         check_predict_cancel()
-        calc, model_name = get_calculator(chosen, engine, req.model_path, req.head)
+        calc, model_name = get_calculator(chosen, engine, req.model_path, req.head, getattr(req, 'model_type', None))
         check_predict_cancel()
     except PredictionCancelled:
         raise HTTPException(409, "Prediction cancelled")
@@ -443,7 +541,7 @@ def predict_frames_stream(req: TrajectoryRequest):
         try:
             check_predict_cancel()
             had = set(_calcs)
-            calc, model_name = get_calculator(chosen, engine, req.model_path, req.head)
+            calc, model_name = get_calculator(chosen, engine, req.model_path, req.head, getattr(req, 'model_type', None))
             cold = _load_s if set(_calcs) != had else None
             check_predict_cancel()
         except PredictionCancelled:
@@ -670,6 +768,6 @@ async def predict_frames_job_status(job_id: str, after: int = 0):
 def root():
     return {
         "service": "qdspace-mace-sidecar",
-        "endpoints": ["POST /health", "GET /heads", "POST /model", "POST /structure", "POST /predict", "POST /predict-frames", "POST /predict-frames-stream", "POST /predict-frames-job", "GET /predict-frames-job/{job_id}", "POST /cancel-predict"],
+        "endpoints": ["POST /health", "GET /heads", "POST /model", "POST /model-path", "POST /download-model", "GET /download-model/{id}", "POST /cancel-download/{id}", "POST /structure", "POST /predict", "POST /predict-frames", "POST /predict-frames-stream", "POST /predict-frames-job", "GET /predict-frames-job/{job_id}", "POST /cancel-predict"],
         "docs": "/docs",
     }

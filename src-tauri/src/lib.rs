@@ -50,7 +50,7 @@ struct Probe {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
-    .invoke_handler(tauri::generate_handler![pick_python_path, check_user_python, apply_user_python, cancel_python_install, python_install_status, take_sidecar_failure, library_cache_read, library_cache_write, library_cache_stat, library_cache_dir])
+    .invoke_handler(tauri::generate_handler![pick_python_path, pick_folder, pick_model_path, check_user_python, apply_user_python, cancel_python_install, python_install_status, take_sidecar_failure, library_cache_read, library_cache_write, library_cache_stat, library_cache_dir])
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -1619,6 +1619,155 @@ fn pick_python_path_linux() -> Result<Option<String>, String> {
     Ok(output) if output.status.code() == Some(1) => Ok(None),
     Ok(output) => Err(command_error("Could not open a file dialog. Paste the Python path instead.", &output)),
     Err(_) => Err("Paste the path to the conda environment Python. A file dialog is not available.".into()),
+  }
+}
+
+#[tauri::command]
+fn pick_folder() -> Result<Option<String>, String> {
+  #[cfg(windows)]
+  {
+    return pick_folder_windows();
+  }
+  #[cfg(target_os = "macos")]
+  {
+    return pick_folder_macos();
+  }
+  #[cfg(all(unix, not(target_os = "macos")))]
+  {
+    return pick_folder_linux();
+  }
+  #[cfg(not(any(windows, unix)))]
+  {
+    Err("Paste a folder path. A folder dialog is not available on this system.".into())
+  }
+}
+
+#[cfg(windows)]
+fn pick_folder_windows() -> Result<Option<String>, String> {
+  let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'Choose a folder for foundation model downloads'
+$dialog.ShowNewFolderButton = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::Out.Write($dialog.SelectedPath)
+}
+"#;
+  let mut cmd = std::process::Command::new("powershell.exe");
+  cmd.args(["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", script]);
+  let output = cmd.output().map_err(|err| format!("Could not open a folder dialog: {err}"))?;
+  if !output.status.success() {
+    return Err(command_error("Could not open a folder dialog.", &output));
+  }
+  let path = output_text(&output.stdout);
+  if path.is_empty() { Ok(None) } else { Ok(Some(path)) }
+}
+
+#[cfg(target_os = "macos")]
+fn pick_folder_macos() -> Result<Option<String>, String> {
+  let mut cmd = std::process::Command::new("osascript");
+  cmd.args(["-e", "POSIX path of (choose folder with prompt \"Choose a folder for foundation model downloads\")"]);
+  hidden(&mut cmd);
+  let output = cmd.output().map_err(|err| format!("Could not open a folder dialog: {err}"))?;
+  if !output.status.success() {
+    let detail = command_output_text(&output).to_lowercase();
+    if detail.contains("cancel") || detail.contains("-128") {
+      return Ok(None);
+    }
+    return Err(command_error("Could not open a folder dialog.", &output));
+  }
+  let path = output_text(&output.stdout);
+  if path.is_empty() { Ok(None) } else { Ok(Some(path)) }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pick_folder_linux() -> Result<Option<String>, String> {
+  let mut cmd = std::process::Command::new("zenity");
+  cmd.args(["--file-selection", "--directory", "--title=Choose a folder for foundation model downloads"]);
+  hidden(&mut cmd);
+  match cmd.output() {
+    Ok(output) if output.status.success() => {
+      let path = output_text(&output.stdout);
+      if path.is_empty() { Ok(None) } else { Ok(Some(path)) }
+    }
+    Ok(output) if output.status.code() == Some(1) => Ok(None),
+    Ok(output) => Err(command_error("Could not open a folder dialog.", &output)),
+    Err(_) => Err("Paste a folder path. A folder dialog is not available.".into()),
+  }
+}
+
+#[tauri::command]
+fn pick_model_path() -> Result<Option<String>, String> {
+  #[cfg(windows)]
+  {
+    return pick_model_path_windows();
+  }
+  #[cfg(target_os = "macos")]
+  {
+    return pick_model_path_macos();
+  }
+  #[cfg(all(unix, not(target_os = "macos")))]
+  {
+    return pick_model_path_linux();
+  }
+  #[cfg(not(any(windows, unix)))]
+  {
+    Err("Paste the path to a .model file. A file dialog is not available on this system.".into())
+  }
+}
+
+#[cfg(windows)]
+fn pick_model_path_windows() -> Result<Option<String>, String> {
+  let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Select a MACE model file'
+$dialog.Filter = 'MACE model|*.model;*.pth;*.pt;*.pt2|All files|*.*'
+$dialog.CheckFileExists = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  [Console]::Out.Write($dialog.FileName)
+}
+"#;
+  let mut cmd = std::process::Command::new("powershell.exe");
+  cmd.args(["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", script]);
+  let output = cmd.output().map_err(|err| format!("Could not open a file dialog: {err}"))?;
+  if !output.status.success() {
+    return Err(command_error("Could not open a file dialog.", &output));
+  }
+  let path = output_text(&output.stdout);
+  if path.is_empty() { Ok(None) } else { Ok(Some(path)) }
+}
+
+#[cfg(target_os = "macos")]
+fn pick_model_path_macos() -> Result<Option<String>, String> {
+  let mut cmd = std::process::Command::new("osascript");
+  cmd.args(["-e", "POSIX path of (choose file with prompt \"Select a MACE model file\")"]);
+  hidden(&mut cmd);
+  let output = cmd.output().map_err(|err| format!("Could not open a file dialog: {err}"))?;
+  if !output.status.success() {
+    let detail = command_output_text(&output).to_lowercase();
+    if detail.contains("cancel") || detail.contains("-128") {
+      return Ok(None);
+    }
+    return Err(command_error("Could not open a file dialog.", &output));
+  }
+  let path = output_text(&output.stdout);
+  if path.is_empty() { Ok(None) } else { Ok(Some(path)) }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pick_model_path_linux() -> Result<Option<String>, String> {
+  let mut cmd = std::process::Command::new("zenity");
+  cmd.args(["--file-selection", "--title=Select a MACE model file", "--file-filter=MACE model | *.model *.pth *.pt *.pt2"]);
+  hidden(&mut cmd);
+  match cmd.output() {
+    Ok(output) if output.status.success() => {
+      let path = output_text(&output.stdout);
+      if path.is_empty() { Ok(None) } else { Ok(Some(path)) }
+    }
+    Ok(output) if output.status.code() == Some(1) => Ok(None),
+    Ok(output) => Err(command_error("Could not open a file dialog. Paste the model path instead.", &output)),
+    Err(_) => Err("Paste the path to a .model file. A file dialog is not available.".into()),
   }
 }
 

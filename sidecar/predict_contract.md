@@ -37,7 +37,8 @@ Health / readiness probe. Body optional / empty.
   "model": "mace-mp-0-large",
   "model_loaded": false,
   "device": "cpu",
-  "model_path": "/workspace/qdspace-ml-spike/models/2024-01-07-mace-128-L2_epoch-199.model"
+  "model_path": "/workspace/qdspace-ml-spike/models/2024-01-07-mace-128-L2_epoch-199.model",
+  "mace_torch": "0.3.12"
 }
 ```
 
@@ -221,3 +222,49 @@ curl -s -X POST http://127.0.0.1:8765/predict \
   -H 'Content-Type: application/json' \
   -d '{"symbols":["O","H","H"],"positions":[[0,0,0],[0.757,0.586,0],[-0.757,0.586,0]],"pbc":false}'
 ```
+
+
+---
+
+## Foundation model download (Predict item 6)
+
+### `POST /model-path`
+
+Register an absolute model path without uploading bytes (preferred for large `.model` files).
+
+```json
+{ "path": "C:\\Models\\mace-mpa-0-medium.model", "model_type": null }
+```
+
+Response mirrors `POST /model` (`model_path`, `filename`, `bytes`, `heads`, `selected`, `model_type`).
+
+`model_type` of `"PolarMACE"` is stored for later `/predict` loads of POLAR models.
+
+### `POST /download-model`
+
+```json
+{ "url": "https://github.com/ACEsuit/mace-foundations/releases/download/...", "dest_dir": "C:\\Models", "filename": "optional.model", "expected_size": 79462305, "sha256": null }
+```
+
+Returns `{ "job_id", "status" }`. Hosts are allowlisted (`github.com`, `raw.githubusercontent.com`, `huggingface.co`, …). Writes to `filename.part` then renames.
+
+### `GET /download-model/{job_id}`
+
+`{ "id", "status", "bytes_done", "bytes_total", "path", "error", "url" }` — `status` is `starting|running|done|cancelled|error`.
+
+### `POST /cancel-download/{job_id}`
+
+Stops an in-flight download; partial `.part` is removed.
+
+### Predict `model_type`
+
+`POST /predict`, `/predict-frames*`, and job variants accept optional `model_type` (e.g. `"PolarMACE"`). Passed through to `MACECalculator`.
+
+### tauri:dev sidecar refresh
+
+The running sidecar is often the copy under `src-tauri/target/debug/mace-runtime/`. After editing `sidecar/sidecar_app.py` (or `model_download.py` / `mace_engine.py`), either:
+
+1. Copy the changed files into that runtime folder and restart `npm run tauri:dev`, or
+2. Rebuild the runtime with `npm run mace-runtime` if you use the bundled sidecar.
+
+Curated catalog: `src/lib/maceModels.json`. UI: Predict → Model → **Download foundation model…**.
