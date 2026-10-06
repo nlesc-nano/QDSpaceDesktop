@@ -1,0 +1,17 @@
+# Builder runtime packages (scripts/build-builder-runtime.mjs).
+# Desktop-minimal subset of QDSpaceWebApp/requirements.txt: only what
+# /builder/api/* needs. No torch, boto3, mangum, kaleido.
+# QD_Builder and miniCAT are installed by the script from pinned GitHub archives.
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+pydantic>=2
+ase>=3.22.1
+numpy>=1.24
+scipy>=1.11
+pyyaml>=6
+rdkit>=2023.9
+# pymatgen 2026.x is a pure wheel on top of pymatgen-core, which has no Intel
+# macOS wheels. Intel Macs stay on the last pymatgen with x86_64 wheels.
+pymatgen>=2023.7; sys_platform != "darwin" or platform_machine != "x86_64"
+pymatgen>=2023.7,<=2025.10.7; sys_platform == "darwin" and platform_machine == "x86_64"

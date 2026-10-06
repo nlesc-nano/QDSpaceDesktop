@@ -6,10 +6,18 @@
   import Builder from './Builder.svelte';
   import Library from './Library.svelte';
   import Predict from './Predict.svelte';
+  import { onMount } from 'svelte';
   import { isDesktopApp } from './lib/desktop.js';
+  import { startCatalogRefresh } from './lib/remoteLibrary.js';
 
   let currentRoute = $state('home');
   const desktop = isDesktopApp();
+
+  // Desktop: refresh the Library catalog from quantumdotspace.org in the background
+  // (bundled copy stays the offline fallback). Never blocks the UI.
+  onMount(() => {
+    if (desktop) startCatalogRefresh();
+  });
 
   // Library -> Builder hand-off (open a library structure in post-treatment)
   let builderHandoff = $state(null);

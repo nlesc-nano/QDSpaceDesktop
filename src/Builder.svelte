@@ -4,11 +4,26 @@
   import { bulkTemplates } from './bulkTemplates.js';
   import { isDesktopApp } from './lib/desktop.js';
 
-  const BUILDER_NOT_INCLUDED = 'The structure builder is not included in this installer yet.';
+  // The desktop app starts the Builder service (builder-runtime) on 127.0.0.1:8000 itself; no Docker.
+  const BUILDER_NOT_INCLUDED = 'The local Builder service on 127.0.0.1:8000 is not responding. It starts with the app; if this persists, restart QDSpace Desktop.';
 
   function localBuilderMissing(err) {
     const msg = err && err.message ? String(err.message) : String(err ?? '');
     return err instanceof TypeError || /failed to fetch|networkerror|load failed|network request failed/i.test(msg);
+  }
+
+  // The desktop Builder process needs a few seconds to import pymatgen/RDKit after launch.
+  // Retry connection failures only (not HTTP errors) for up to ~30 s before giving up.
+  async function fetchLocalBuilder(url, init) {
+    const attempts = isDesktopApp() ? 20 : 1;
+    for (let i = 1; ; i++) {
+      try {
+        return await fetch(url, init);
+      } catch (err) {
+        if (i >= attempts || !localBuilderMissing(err)) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    }
   }
 
   function wurtziteTemplateFor(file) {
@@ -776,7 +791,7 @@
       : "/builder/api/analyze_cif";
       
     try {
-      const res = await fetch(ANALYZE_URL, { method: 'POST', body: formData });
+      const res = await fetchLocalBuilder(ANALYZE_URL, { method: 'POST', body: formData });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       
@@ -1276,7 +1291,7 @@
       : "/builder/api/build_stream";
 
     try {
-      const res = await fetch(BUILD_STREAM_URL, { method: 'POST', body: formData });
+      const res = await fetchLocalBuilder(BUILD_STREAM_URL, { method: 'POST', body: formData });
       if (!res.ok) {
         const errorText = await res.text();
         let detail = errorText;

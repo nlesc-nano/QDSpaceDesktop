@@ -3,18 +3,19 @@
   import Viewer from "./Viewer.svelte";
   import { templateFor } from "./bulkTemplates.js";
   import { makeZip } from "./zip.js";
+  import { isDesktopApp } from "./lib/desktop.js";
+  import {
+    findLocalLibraryFile, downloadLibraryFile, loadLibraryFile, remoteLibrarySize, remoteLibraryExists,
+    cachedSizes, shouldAskBeforeDownload, getAlwaysDownload, setAlwaysDownload, formatBytes,
+    loadBundledCatalog, loadCachedCatalog, fetchRemoteCatalog, startCatalogRefresh, newerIndex, isValidLibraryIndex,
+  } from "./lib/remoteLibrary.js";
 
   // Opens a structure in the Builder's post-treatment view (set by App).
   let { onOpenInBuilder = null } = $props();
 
-  // Structures are not bundled. Prefer /library_index.json, then the published site.
-  const LIBRARY_REMOTE = "https://dmq59n0f96mxz.cloudfront.net";
-  let assetBase = $state("");
-
-  function assetUrl(path) {
-    const pth = String(path || "").startsWith("/") ? String(path) : `/${path}`;
-    return `${assetBase}${pth}`;
-  }
+  // Structure files are not bundled: src/lib/remoteLibrary.js finds them in the local
+  // cache or downloads them on demand from the public QDSpace site.
+  const desktop = isDesktopApp();
 
   // --- Index (library_index.json: one record per structure) ---
   let structures = $state([]);
@@ -48,37 +49,70 @@
   let fileUrl = $state("");
   let loadingStage = $state(false);
   let previousBlobUrl = null;
+  // Structure file state: "idle" | "loading" | "missing" (not downloaded, user cancelled) | "error" | "ready"
+  let stageStatus = $state("idle");
+  let stageError = $state("");
+  let loadToken = 0;
+
+  // Download confirmation modal (desktop): { title, name, detail, path, kind, size, phase, progress, error, onDone }
+  let downloadDialog = $state(null);
+  let dontAskAgain = $state(getAlwaysDownload());
+  let dialogAbort = null;
 
   let propertiesStatus = $state("idle");
   let activePropertyTab = $state("fuzzy_sf");
+  // Library-relative plot paths per tab; plotView is what the iframe shows for the active tab.
   let plotUrls = $state({ fuzzy_sf: null, fuzzy_soc: null, exciton_sf: null, exciton_soc: null });
+  let plotView = $state({ status: "idle", url: "", size: null, error: "", progress: "" });
+  let plotBlobUrl = null;
+  let plotToken = 0;
+  let catalogNote = $state("");
 
   const SOURCE_LABEL = { builder: "Builder", dft: "DFT", "builder+dft": "Builder + DFT" };
   const PHASE_SHORT = { "zinc-blende": "zb", wurtzite: "wz", "rock-salt": "rs" };
 
-  onMount(async () => {
-    try {
-      let res = await fetch("/library_index.json");
-      let fromRemote = false;
-      if (!res.ok) {
-        res = await fetch(`${LIBRARY_REMOTE}/library_index.json`);
-        fromRemote = true;
+  // Catalog: bundled copy (works offline) or the newer remote copy cached by a previous
+  // run; the desktop app refreshes it from the public site in the background.
+  let indexInUse = null;
+  function useIndex(index) {
+    indexInUse = index;
+    structures = index.structures || [];
+    loadError = "";
+  }
+
+  onMount(() => {
+    let alive = true;
+    (async () => {
+      const [bundled, cached] = await Promise.all([
+        loadBundledCatalog("library_index.json"),
+        desktop ? loadCachedCatalog("library_index.json") : null,
+      ]);
+      const local = newerIndex(bundled, cached);
+      if (!alive) return;
+      if (isValidLibraryIndex(local)) useIndex(local);
+      const remote = await startCatalogRefresh();
+      if (!alive) return;
+      if (isValidLibraryIndex(remote) && newerIndex(indexInUse, remote) === remote && remote !== indexInUse) {
+        const had = structures.length;
+        useIndex(remote);
+        if (had) catalogNote = `Catalog updated from quantumdotspace.org (${remote.structures.length} structures).`;
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const index = await res.json();
-      structures = index.structures || [];
-      if (fromRemote) {
-        assetBase = LIBRARY_REMOTE;
-      } else {
-        const probe = structures[0]?.stages?.[0]?.file;
-        if (probe) {
-          const head = await fetch(`/${probe}`, { method: "HEAD" }).catch(() => null);
-          if (!head?.ok) assetBase = LIBRARY_REMOTE;
+      if (!structures.length) {
+        if (!desktop) {
+          const web = await fetchRemoteCatalog("library_index.json", { persist: false });
+          if (alive && isValidLibraryIndex(web)) useIndex(web);
         }
+        if (alive && !structures.length) loadError = "Failed to load the library index.";
       }
-    } catch (err) {
-      loadError = `Failed to load the library index: ${err.message}`;
-    }
+    })().catch((err) => {
+      if (alive) loadError = `Failed to load the library index: ${err.message}`;
+    });
+    return () => {
+      alive = false;
+      dialogAbort?.abort();
+      if (previousBlobUrl) URL.revokeObjectURL(previousBlobUrl);
+      if (plotBlobUrl) URL.revokeObjectURL(plotBlobUrl);
+    };
   });
 
   // --- Helpers ---
@@ -243,33 +277,149 @@
   let currentStage = $derived(current ? current.stages[stageIndex] : null);
   let isMD = $derived(currentStage?.stage === "md");
 
-  async function selectStage(i) {
-    if (!current) return;
-    stageIndex = i;
-    const st = current.stages[i];
-    loadingStage = true;
+  const stageKind = (st) => (st?.stage === "md" ? "md" : "xyz");
+
+  function clearDisplayedStage() {
+    xyzText = "";
+    fileUrl = "";
     if (previousBlobUrl) {
       URL.revokeObjectURL(previousBlobUrl);
       previousBlobUrl = null;
     }
-    try {
-      const res = await fetch(assetUrl(st.file));
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = (await res.text()).replace(/\r\n/g, "\n");
-      if (st.stage === "md") {
-        xyzText = "";
-        fileUrl = trajectoryBlobUrl(text) || assetUrl(st.file);
-      } else {
-        xyzText = text;
-        fileUrl = assetUrl(st.file);
-      }
-    } catch (err) {
-      xyzText = "";
-      fileUrl = "";
-      loadError = `Could not load ${st.file}: ${err.message}`;
-    } finally {
-      loadingStage = false;
+  }
+
+  // Show validated text in the viewer.
+  function showStage(st, raw) {
+    const text = raw.replace(/\r\n/g, "\n");
+    clearDisplayedStage();
+    if (st.stage === "md") {
+      const url = trajectoryBlobUrl(text);
+      if (!url) throw new Error("not a readable trajectory");
+      fileUrl = url;
+    } else {
+      xyzText = text;
     }
+    stageStatus = "ready";
+    stageError = "";
+  }
+
+  async function selectStage(i) {
+    if (!current) return;
+    const token = ++loadToken;
+    stageIndex = i;
+    const record = current;
+    const st = record.stages[i];
+    clearDisplayedStage();
+    closeDownloadDialog();
+    stageStatus = "loading";
+    loadingStage = true;
+    try {
+      const local = await findLocalLibraryFile(st.file, stageKind(st));
+      if (token !== loadToken) return;
+      if (local) {
+        showStage(st, local.text);
+        return;
+      }
+      if (shouldAskBeforeDownload()) {
+        loadingStage = false;
+        stageStatus = "missing";
+        askToDownloadStage(record, st, token);
+        return;
+      }
+      const text = await downloadLibraryFile(st.file, stageKind(st));
+      if (token !== loadToken) return;
+      showStage(st, text);
+    } catch (err) {
+      if (token !== loadToken) return;
+      clearDisplayedStage();
+      stageStatus = "error";
+      stageError = "Couldn't download this structure. Check your internet connection.";
+      console.warn(`[library] ${st.file}:`, err);
+    } finally {
+      if (token === loadToken) loadingStage = false;
+    }
+  }
+
+  function retryStage() {
+    if (current) selectStage(stageIndex);
+  }
+
+  // --- Download confirmation modal ---
+  function askToDownloadStage(record, st, token = loadToken) {
+    const md = st.stage === "md";
+    openDownloadDialog({
+      title: md ? "Download MD trajectory?" : "Download structure?",
+      name: record.formula,
+      detail: `${stageLabel(st)} · ${record.id}`,
+      path: st.file,
+      kind: stageKind(st),
+      what: md ? "trajectory" : "structure",
+      onDone: (text) => {
+        if (token !== loadToken) return;
+        try {
+          showStage(st, text);
+        } catch {
+          stageStatus = "error";
+          stageError = "Couldn't download this structure. Check your internet connection.";
+        }
+      },
+    });
+  }
+
+  function openDownloadDialog(opts) {
+    dialogAbort?.abort();
+    dialogAbort = null;
+    dontAskAgain = getAlwaysDownload();
+    downloadDialog = { ...opts, size: undefined, phase: "ask", progress: "", error: "" };
+    const dialog = downloadDialog;
+    remoteLibrarySize(opts.path).then((n) => {
+      if (downloadDialog === dialog || downloadDialog?.path === opts.path) downloadDialog.size = n;
+    });
+  }
+
+  function closeDownloadDialog() {
+    dialogAbort?.abort();
+    dialogAbort = null;
+    downloadDialog = null;
+  }
+
+  async function confirmDownload() {
+    const dialog = downloadDialog;
+    if (!dialog || dialog.phase === "downloading") return;
+    setAlwaysDownload(dontAskAgain);
+    const controller = new AbortController();
+    dialogAbort = controller;
+    dialog.phase = "downloading";
+    dialog.error = "";
+    dialog.progress = "";
+    try {
+      const text = await downloadLibraryFile(dialog.path, dialog.kind, {
+        signal: controller.signal,
+        onProgress: ({ received, total }) => {
+          if (downloadDialog === dialog || downloadDialog?.path === dialog.path) {
+            downloadDialog.progress = total && received <= total
+              ? `${formatBytes(received)} of ${formatBytes(total)}`
+              : formatBytes(received);
+          }
+        },
+      });
+      if (controller.signal.aborted) return;
+      dialogAbort = null;
+      downloadDialog = null;
+      dialog.onDone?.(text);
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      dialogAbort = null;
+      console.warn(`[library] download ${dialog.path}:`, err);
+      if (downloadDialog?.path === dialog.path) {
+        downloadDialog.phase = "error";
+        downloadDialog.error = `Couldn't download this ${dialog.what}. Check your internet connection.`;
+      }
+    }
+  }
+
+  function dialogKeydown(e) {
+    if (e.key === "Escape" && downloadDialog) closeDownloadDialog();
   }
 
   // Downsample a trajectory to ~150 frames for smooth playback.
@@ -299,48 +449,109 @@
   };
 
   async function loadProperties(r) {
+    const token = ++plotToken;
+    resetPlotView();
     plotUrls = { fuzzy_sf: null, fuzzy_soc: null, exciton_sf: null, exciton_soc: null };
     const props = r.properties || {};
     for (const [tab, names] of Object.entries(PROPERTY_FILES)) {
-      const hit = names.find((n) => props[n]);
-      if (hit) plotUrls[tab] = assetUrl(props[hit]);
+      // plot.html.gz is the same plot compressed; the iframe needs the .html.
+      const hit = names.find((n) => props[n] && !n.endsWith(".gz"));
+      if (hit) plotUrls[tab] = props[hit];
     }
     const legacy = (r.origin?.legacy_paths || []).find((p) => !p.endsWith(".xyz"));
     if (!Object.values(plotUrls).some(Boolean) && legacy) {
       propertiesStatus = "loading";
-      const dir = assetUrl(`${legacy}/properties`);
-      const probe = (n) =>
-        fetch(`${dir}/${n}`, { method: "HEAD", cache: "no-store" })
-          .then((res) => (res.ok ? `${dir}/${n}` : null))
-          .catch(() => null);
+      const dir = `${legacy}/properties`;
       for (const [tab, names] of Object.entries(PROPERTY_FILES)) {
-        for (const n of names) {
-          const url = await probe(n);
-          if (url) { plotUrls[tab] = url; break; }
+        for (const n of names.filter((x) => !x.endsWith(".gz"))) {
+          const path = `${dir}/${n}`;
+          const [cached] = await cachedSizes([path]).catch(() => [null]);
+          if (cached || (await remoteLibraryExists(path))) { plotUrls[tab] = path; break; }
         }
       }
+      if (token !== plotToken) return;
     }
     const first = Object.keys(PROPERTY_FILES).find((t) => plotUrls[t]);
     if (first) {
       activePropertyTab = first;
       propertiesStatus = "ready";
+      showPlot(first);
     } else {
       propertiesStatus = "none";
     }
   }
 
-  // --- Actions ---
-  function download() {
-    if (!current || !currentStage) return;
-    const a = document.createElement("a");
-    if (isMD) {
-      a.href = assetUrl(currentStage.file);
-    } else {
-      a.href = URL.createObjectURL(new Blob([xyzText], { type: "text/plain" }));
+  function resetPlotView() {
+    if (plotBlobUrl) URL.revokeObjectURL(plotBlobUrl);
+    plotBlobUrl = null;
+    plotView = { status: "idle", url: "", size: null, error: "", progress: "" };
+  }
+
+  function displayPlot(text) {
+    if (plotBlobUrl) URL.revokeObjectURL(plotBlobUrl);
+    plotBlobUrl = URL.createObjectURL(new Blob([text], { type: "text/html" }));
+    plotView = { status: "ready", url: plotBlobUrl, size: null, error: "", progress: "" };
+  }
+
+  // Plots are shown from a validated local/cached copy via a blob URL, so the app's own
+  // index.html can never end up in the iframe.
+  async function showPlot(tab, { download = false } = {}) {
+    const path = plotUrls[tab];
+    if (!path) return;
+    const token = ++plotToken;
+    activePropertyTab = tab;
+    resetPlotView();
+    plotView.status = "loading";
+    try {
+      const local = await findLocalLibraryFile(path, "plot");
+      if (token !== plotToken) return;
+      if (local) return displayPlot(local.text);
+      if (!download && shouldAskBeforeDownload()) {
+        plotView = { status: "missing", url: "", size: null, error: "", progress: "" };
+        const n = await remoteLibrarySize(path);
+        if (token === plotToken) plotView.size = n;
+        return;
+      }
+      plotView.status = "downloading";
+      const text = await downloadLibraryFile(path, "plot", {
+        onProgress: ({ received }) => { if (token === plotToken) plotView.progress = formatBytes(received); },
+      });
+      if (token === plotToken) displayPlot(text);
+    } catch (err) {
+      if (token !== plotToken) return;
+      console.warn(`[library] plot ${path}:`, err);
+      plotView = { status: "error", url: "", size: null, progress: "",
+                   error: "Couldn't download these properties. Check your internet connection." };
     }
-    const suffix = currentStage.stage === "start" ? (currentStage.dft_start ? "dft_start" : "start") : currentStage.stage;
-    a.download = `${current.id}_${suffix}${currentStage.functional ? "_" + currentStage.functional : ""}.xyz`;
+  }
+
+  // --- Actions ---
+  let downloadBusy = $state(false);
+
+  async function download() {
+    if (!current || !currentStage || stageStatus !== "ready") return;
+    const record = current;
+    const st = currentStage;
+    let text = xyzText;
+    if (isMD) {
+      // The viewer shows a downsampled trajectory; save the full file (already cached).
+      downloadBusy = true;
+      try {
+        text = await loadLibraryFile(st.file, "md");
+      } catch (err) {
+        alert("Couldn't download this trajectory. Check your internet connection.");
+        return;
+      } finally {
+        downloadBusy = false;
+      }
+    }
+    if (!text) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+    const suffix = st.stage === "start" ? (st.dft_start ? "dft_start" : "start") : st.stage;
+    a.download = `${record.id}_${suffix}${st.functional ? "_" + st.functional : ""}.xyz`;
     a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
   }
 
   // --- Download every structure left by the filters as one zip ---
@@ -367,24 +578,52 @@
   async function downloadMatchesZip() {
     const list = matches;
     if (!list.length) return;
-    if (list.length > 150 && !confirm(`Download ${list.length} structures as one zip?`)) return;
+    const wanted = list.flatMap((r) => r.stages.filter((st) => zipIncludeMD || st.stage !== "md").map((st) => st.file));
+    let toFetch = wanted.length;
+    if (desktop) {
+      const sizes = await cachedSizes(wanted).catch(() => wanted.map(() => null));
+      toFetch = sizes.filter((n) => !n).length;
+    }
+    if (desktop && toFetch > 20) {
+      if (!confirm(`Download ${toFetch} files for ${list.length} structures from quantumdotspace.org and pack them into one zip?`)) return;
+    } else if (list.length > 150 && !confirm(`Download ${list.length} structures as one zip?`)) {
+      return;
+    }
     const enc = new TextEncoder();
     const files = [];
     const header = ["id", "formula", "material", "family", "centre", "surface", "facets", "source",
                     "d_nm", "n_atoms", "total_charge", "unit_cells", "files"];
     const rows = [header];
+    // Fetch with a few parallel requests; zip-only downloads are not kept in the disk cache.
+    const texts = new Map();
+    const kinds = new Map(list.flatMap((r) => r.stages.map((st) => [st.file, stageKind(st)])));
+    let done = 0;
+    let failed = 0;
+    const queue = [...new Set(wanted)];
+    const total = queue.length;
+    zipStatus = `Fetching 0/${total} files…`;
+    const worker = async () => {
+      while (queue.length) {
+        const path = queue.shift();
+        try {
+          texts.set(path, await loadLibraryFile(path, kinds.get(path) || "xyz", { persist: false }));
+        } catch {
+          failed++;
+        }
+        zipStatus = `Fetching ${++done}/${total} files…`;
+      }
+    };
     try {
-      for (let k = 0; k < list.length; k++) {
-        const r = list[k];
-        zipStatus = `Fetching ${k + 1}/${list.length}…`;
+      await Promise.all(Array.from({ length: 6 }, worker));
+      for (const r of list) {
         const used = new Set();
         const names = [];
         for (const st of r.stages) {
           if (st.stage === "md" && !zipIncludeMD) continue;
-          const res = await fetch(assetUrl(st.file));
-          if (!res.ok) continue;
+          const text = texts.get(st.file);
+          if (text === undefined) continue;
           const name = stageFileName(st, used);
-          files.push({ name: `${r.id}/${name}`, data: new Uint8Array(await res.arrayBuffer()) });
+          files.push({ name: `${r.id}/${name}`, data: enc.encode(text) });
           names.push(name);
         }
         files.push({ name: `${r.id}/record.json`, data: enc.encode(JSON.stringify(r, null, 1)) });
@@ -401,14 +640,14 @@
       a.download = `qdspace_${tag}_${list.length}_structures.zip`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-      zipStatus = `${list.length} structures, ${(blob.size / 1e6).toFixed(1)} MB`;
+      zipStatus = `${list.length} structures, ${(blob.size / 1e6).toFixed(1)} MB${failed ? ` · ${failed} file(s) could not be downloaded` : ""}`;
     } catch (err) {
       zipStatus = `Download failed: ${err.message}`;
     }
   }
 
   let builderTemplate = $derived(current ? templateFor(current.family, current.material, current.phase) : null);
-  let canOpenInBuilder = $derived(Boolean(onOpenInBuilder && builderTemplate && xyzText && !isMD));
+  let canOpenInBuilder = $derived(Boolean(onOpenInBuilder && builderTemplate && xyzText && stageStatus === "ready" && !isMD));
 
   function openInBuilder() {
     if (!canOpenInBuilder) return;
@@ -439,6 +678,8 @@
   }
 </script>
 
+<svelte:window onkeydown={dialogKeydown} />
+
 <div class="flex flex-col lg:flex-row h-[calc(100vh-64px)] overflow-hidden font-sans bg-slate-50">
   <aside class="w-full lg:w-[400px] p-6 bg-slate-50 overflow-y-auto flex-shrink-0 border-r border-slate-200 flex flex-col gap-6">
     <div class="px-2 pt-2">
@@ -449,6 +690,7 @@
       <p class="text-sm text-slate-600 font-medium leading-relaxed">
         Builder-generated and DFT-computed quantum dots: starting structures, optimized geometries, MD and interactive properties.
       </p>
+      {#if catalogNote}<p class="text-[11px] text-slate-400 mt-1">{catalogNote}</p>{/if}
     </div>
 
     <!-- Filters -->
@@ -659,7 +901,7 @@
                 {/each}
               </div>
             {/if}
-            <button onclick={download} disabled={!current || (!xyzText && !isMD)}
+            <button onclick={download} disabled={!current || stageStatus !== "ready" || downloadBusy}
                     class="bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-800 px-4 py-2 rounded-xl text-sm font-bold transition-colors">Download XYZ</button>
           </div>
         </div>
@@ -670,6 +912,23 @@
           {#if loadingStage}
             <div class="absolute inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center text-white z-10">
               <div class="w-10 h-10 border-4 border-brand-500 border-t-transparent rounded-full animate-spin"></div>
+            </div>
+          {:else if current && currentStage && stageStatus === "missing"}
+            <div class="absolute inset-0 flex items-center justify-center z-10 p-6">
+              <div class="bg-white rounded-2xl shadow-lg border border-slate-200 p-5 max-w-sm text-center">
+                <p class="text-sm font-bold text-slate-900 mb-1">Not downloaded yet</p>
+                <p class="text-xs text-slate-500 mb-4">This {isMD ? "trajectory" : "structure"} isn't on your computer yet.</p>
+                <button class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold px-4 py-2 rounded-xl transition-colors"
+                        onclick={() => askToDownloadStage(current, currentStage)}>Download…</button>
+              </div>
+            </div>
+          {:else if current && stageStatus === "error"}
+            <div class="absolute inset-0 flex items-center justify-center z-10 p-6">
+              <div class="bg-white rounded-2xl shadow-lg border border-red-100 p-5 max-w-sm text-center">
+                <p class="text-sm font-bold text-red-700 mb-4">{stageError || "Couldn't download this structure. Check your internet connection."}</p>
+                <button class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold px-4 py-2 rounded-xl transition-colors"
+                        onclick={retryStage}>Retry</button>
+              </div>
             </div>
           {/if}
         </div>
@@ -781,6 +1040,8 @@
             <p class="text-[11px] text-slate-500 mt-2">No bulk template for {current.material} yet.</p>
           {:else if isMD}
             <p class="text-[11px] text-slate-500 mt-2">Select a single-geometry stage (not MD).</p>
+          {:else if current && stageStatus !== "ready"}
+            <p class="text-[11px] text-slate-500 mt-2">Download the structure to open it in the Builder.</p>
           {/if}
         </div>
       </div>
@@ -795,7 +1056,7 @@
             {#each [["fuzzy_sf", "Fuzzy - PDOS - COOP (Spin Free)"], ["fuzzy_soc", "Fuzzy - PDOS - COOP (SOC)"], ["exciton_sf", "Excited States (Spin Free)"], ["exciton_soc", "Excited States (SOC)"]] as [tab, label]}
               {#if plotUrls[tab]}
                 <button class="px-4 py-2 text-xs md:text-sm font-bold rounded-xl transition-all {activePropertyTab === tab ? 'bg-brand-50 text-brand-700 shadow-sm ring-1 ring-brand-200' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-700'}"
-                        onclick={() => (activePropertyTab = tab)}>{label}</button>
+                        onclick={() => showPlot(tab)}>{label}</button>
               {/if}
             {/each}
           </div>
@@ -816,12 +1077,71 @@
             <span class="font-bold mb-1">No properties yet</span>
             <span class="text-xs">Properties are available for DFT-optimized structures once they have been computed.</span>
           </div>
-        {:else if plotUrls[activePropertyTab]}
-          <iframe title="Interactive Properties" src={plotUrls[activePropertyTab]}
+        {:else if plotView.status === "ready" && plotView.url}
+          <iframe title="Interactive Properties" src={plotView.url}
                   class="absolute inset-0 w-full h-full rounded-[1rem] border border-slate-200 bg-white"
                   sandbox="allow-scripts allow-same-origin allow-popups allow-modals" referrerpolicy="no-referrer"></iframe>
+        {:else if plotView.status === "missing"}
+          <div class="absolute inset-0 flex flex-col items-center justify-center bg-slate-50 text-slate-600 rounded-2xl text-sm border border-slate-200 border-dashed text-center px-6">
+            <span class="font-bold mb-1">Interactive properties aren't on your computer yet</span>
+            <span class="text-xs text-slate-500 mb-4">Download them{plotView.size ? ` (≈${formatBytes(plotView.size)})` : ""} from quantumdotspace.org. They are kept for offline use.</span>
+            <button class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold px-4 py-2 rounded-xl transition-colors"
+                    onclick={() => showPlot(activePropertyTab, { download: true })}>Download</button>
+          </div>
+        {:else if plotView.status === "error"}
+          <div class="absolute inset-0 flex flex-col items-center justify-center bg-slate-50 rounded-2xl text-sm border border-red-100 text-center px-6">
+            <span class="font-bold text-red-700 mb-4">{plotView.error}</span>
+            <button class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold px-4 py-2 rounded-xl transition-colors"
+                    onclick={() => showPlot(activePropertyTab, { download: true })}>Retry</button>
+          </div>
+        {:else if plotView.status === "loading" || plotView.status === "downloading"}
+          <div class="absolute inset-0 flex flex-col items-center justify-center bg-slate-50 text-brand-600 rounded-2xl text-sm font-bold border border-brand-100">
+            <div class="w-8 h-8 border-4 border-brand-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+            {plotView.status === "downloading" ? `Downloading…${plotView.progress ? " " + plotView.progress : ""}` : "Loading properties…"}
+          </div>
         {/if}
       </div>
     </div>
   </main>
 </div>
+
+{#if downloadDialog}
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4"
+       role="presentation" onclick={(e) => { if (e.target === e.currentTarget && downloadDialog?.phase !== "downloading") closeDownloadDialog(); }}>
+    <div class="bg-white rounded-[1.5rem] shadow-2xl border border-slate-100 w-full max-w-md p-6"
+         role="dialog" aria-modal="true" aria-labelledby="library-download-title">
+      <h2 id="library-download-title" class="font-heading text-lg font-bold text-slate-900 mb-1">{downloadDialog.title}</h2>
+      <p class="text-base font-bold text-slate-900">{#each formulaParts(downloadDialog.name) as p}{#if p.sub}<sub>{p.t}</sub>{:else}{p.t}{/if}{/each}</p>
+      <p class="text-xs text-slate-500 mb-4 break-all">{downloadDialog.detail}</p>
+      <div class="bg-slate-50 rounded-xl border border-slate-200 p-3 text-sm text-slate-700 mb-4">
+        <p>This {downloadDialog.what} isn't on your computer yet. It will be downloaded from quantumdotspace.org and kept for offline use.</p>
+        <p class="mt-1.5 text-xs text-slate-500">
+          Size:
+          <span class="font-bold text-slate-700">
+            {downloadDialog.size === undefined ? "checking…" : downloadDialog.size ? `≈${formatBytes(downloadDialog.size)}` : "unknown"}
+          </span>
+        </p>
+      </div>
+      {#if downloadDialog.phase === "downloading"}
+        <div class="flex items-center gap-3 text-sm font-bold text-brand-700 mb-4">
+          <div class="w-5 h-5 border-[3px] border-brand-500 border-t-transparent rounded-full animate-spin"></div>
+          Downloading…{#if downloadDialog.progress}<span class="font-medium text-slate-500">{downloadDialog.progress}</span>{/if}
+        </div>
+      {:else if downloadDialog.phase === "error"}
+        <p class="text-sm font-bold text-red-700 bg-red-50 border border-red-100 rounded-xl p-3 mb-4">{downloadDialog.error}</p>
+      {/if}
+      <label class="flex items-center gap-2 text-xs text-slate-600 cursor-pointer mb-5">
+        <input type="checkbox" bind:checked={dontAskAgain} class="accent-accent-600" disabled={downloadDialog.phase === "downloading"} />
+        Don't ask again (download automatically)
+      </label>
+      <div class="flex justify-end gap-2">
+        <button class="bg-slate-100 hover:bg-slate-200 text-slate-800 px-4 py-2 rounded-xl text-sm font-bold transition-colors"
+                onclick={closeDownloadDialog}>Cancel</button>
+        <button class="bg-brand-600 hover:bg-brand-700 disabled:bg-slate-300 text-white px-4 py-2 rounded-xl text-sm font-bold shadow-glow transition-all disabled:shadow-none"
+                onclick={confirmDownload} disabled={downloadDialog.phase === "downloading"}>
+          {downloadDialog.phase === "error" ? "Retry" : "Download"}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}

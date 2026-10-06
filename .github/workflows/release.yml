@@ -55,6 +55,11 @@ jobs:
           QDSPACE_MAC_ARCH: ${{ contains(matrix.args, 'x86_64-apple-darwin') && 'x86_64' || 'aarch64' }}
         run: node scripts/build-mace-runtime.mjs
 
+      - name: Build bundled Builder runtime
+        env:
+          QDSPACE_MAC_ARCH: ${{ contains(matrix.args, 'x86_64-apple-darwin') && 'x86_64' || 'aarch64' }}
+        run: node scripts/build-builder-runtime.mjs
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -68,7 +73,8 @@ jobs:
           releaseBody: |
             Installers for Windows, Linux, and macOS.
             The CPU MACE sidecar is included (Python 3.11 and a CPU PyTorch build of MACE, started on 127.0.0.1:8765).
-            The structure library and the Builder Docker image are still not included.
+            The structure Builder is included and starts on 127.0.0.1:8000 (no Docker needed).
+            The structure library is still not included.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

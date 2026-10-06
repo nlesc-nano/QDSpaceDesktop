@@ -42,6 +42,12 @@ mace-runtime/*
 !mace-runtime/.gitkeep
 qdspace-mace-runtime/
 
+# Built Builder runtime (scripts/build-builder-runtime.mjs): portable Python +
+# FastAPI + QD_Builder/pymatgen/RDKit, ~0.6-0.7 GB. Same rule as mace-runtime;
+# the .gitkeep lets bundle.resources resolve before the runtime is built.
+builder-runtime/*
+!builder-runtime/.gitkeep
+
 # Local model drops. The default MACE-MP-0 large checkpoint is ~61 MB
 # (under GitHub's 100 MB limit) and IS committed so installer CI can pack it.
 sidecar/models/*

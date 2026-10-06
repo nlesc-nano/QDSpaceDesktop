@@ -1,6 +1,8 @@
 use tauri::Manager;
 
 const SIDECAR_PORT: u16 = 8765;
+/// Structure Builder API (src/Builder.svelte calls /builder/api/* here).
+const BUILDER_PORT: u16 = 8000;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,7 +50,7 @@ struct Probe {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
-    .invoke_handler(tauri::generate_handler![pick_python_path, check_user_python, apply_user_python, cancel_python_install, python_install_status, take_sidecar_failure])
+    .invoke_handler(tauri::generate_handler![pick_python_path, check_user_python, apply_user_python, cancel_python_install, python_install_status, take_sidecar_failure, library_cache_read, library_cache_write, library_cache_stat, library_cache_dir])
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -167,27 +169,115 @@ fn start_developer_services(root: &std::path::Path) {
       eprintln!("sidecar Python was not found at {}", python.display());
     }
   }
+}
 
-  if !listening(8000) {
-    let mut cmd = std::process::Command::new("docker");
-    cmd
-      .args(["run", "--rm", "-p", "8000:8000", "qdspace-builder"])
-      .stdin(std::process::Stdio::null())
-      .stdout(std::process::Stdio::null())
-      .stderr(std::process::Stdio::null());
-    hidden(&mut cmd);
-    match cmd.spawn() {
-      Ok(child) => {
-        std::mem::forget(child);
-      }
-      Err(err) => eprintln!("could not start Builder container: {err}"),
-    }
+/// A Builder runtime folder from scripts/build-builder-runtime.mjs:
+/// python.exe (Windows) or bin/python, plus app/builder_app.py.
+fn builder_runtime_at(runtime: std::path::PathBuf) -> Option<std::path::PathBuf> {
+  let script = runtime.join("app").join("builder_app.py");
+  if script.is_file() && bundled_python(&runtime).is_some() {
+    Some(runtime)
+  } else {
+    None
   }
 }
 
+/// Packed Builder from bundle.resources (resource_dir/builder-runtime).
+/// Debug builds (`tauri dev`) also accept the repo's builder-runtime/ next to
+/// src-tauri, so `npm run builder-runtime` is enough to get Builder in dev.
+fn builder_runtime(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+  if let Ok(resource_dir) = app.path().resource_dir() {
+    if let Some(runtime) = builder_runtime_at(resource_dir.join("builder-runtime")) {
+      return Some(runtime);
+    }
+  }
+  #[cfg(debug_assertions)]
+  {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(repo) = manifest.parent() {
+      if let Some(runtime) = builder_runtime_at(repo.join("builder-runtime")) {
+        return Some(runtime);
+      }
+    }
+  }
+  None
+}
+
+fn spawn_builder(python: &std::path::Path, cwd: &std::path::Path) {
+  let mut cmd = std::process::Command::new(python);
+  cmd
+    .args(["-m", "uvicorn", "builder_app:app", "--host", "127.0.0.1", "--port", "8000"])
+    .current_dir(cwd)
+    .stdin(std::process::Stdio::null());
+  // Startup errors (a missing module, port clash) land here instead of vanishing.
+  let log_path = std::env::temp_dir().join("qdspace-builder.log");
+  match std::fs::File::create(&log_path).and_then(|file| Ok((file.try_clone()?, file))) {
+    Ok((stdout, stderr)) => {
+      cmd.stdout(std::process::Stdio::from(stdout)).stderr(std::process::Stdio::from(stderr));
+    }
+    Err(_) => {
+      cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    }
+  }
+  with_python_env(&mut cmd, python);
+  // The packed interpreter must not pick up a developer's Python environment.
+  cmd.env_remove("PYTHONPATH");
+  cmd.env_remove("PYTHONHOME");
+  cmd.env("PYTHONUNBUFFERED", "1");
+  cmd.env("MPLBACKEND", "Agg");
+  hidden(&mut cmd);
+  match cmd.spawn() {
+    Ok(child) => {
+      std::mem::forget(child);
+    }
+    Err(err) => eprintln!("could not start Builder: {err}"),
+  }
+}
+
+/// Old developer path: the qdspace-builder Docker image. Only used when
+/// QDSPACE_ROOT is set and no builder-runtime was built. Installers never
+/// reach this, so end users do not need Docker for Builder.
+fn spawn_builder_docker() {
+  let mut cmd = std::process::Command::new("docker");
+  cmd
+    .args(["run", "--rm", "-p", "8000:8000", "qdspace-builder"])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+  hidden(&mut cmd);
+  match cmd.spawn() {
+    Ok(child) => {
+      std::mem::forget(child);
+    }
+    Err(err) => eprintln!("could not start Builder container: {err}"),
+  }
+}
+
+/// Start the Builder API on 127.0.0.1:8000: packed builder-runtime first
+/// (installers and `tauri dev` after `npm run builder-runtime`), then Docker
+/// only as a developer fallback. Leaves an existing listener on 8000 alone.
+fn start_builder(app: &tauri::AppHandle) {
+  if listening(BUILDER_PORT) {
+    return;
+  }
+  if let Some(runtime) = builder_runtime(app) {
+    if let Some(python) = bundled_python(&runtime) {
+      spawn_builder(&python, &runtime.join("app"));
+      return;
+    }
+  }
+  if project_root().is_some() {
+    spawn_builder_docker();
+    return;
+  }
+  eprintln!("Builder runtime not found. Run `npm run builder-runtime` to build it.");
+}
+
 fn start_local_services(app: &tauri::AppHandle) {
-  // QDSPACE_ROOT is the developer tree (conda sidecar + Builder Docker).
-  // Installers leave it unset and must not start Docker.
+  // Builder runs from the packed builder-runtime (no Docker for installers).
+  start_builder(app);
+
+  // QDSPACE_ROOT is the developer tree (conda sidecar).
   if let Some(root) = project_root() {
     start_developer_services(&root);
     return;
@@ -1598,4 +1688,99 @@ async fn apply_user_python(app: tauri::AppHandle, python_path: String, packages:
     end_install_session();
   }
   outcome
+}
+
+// ---------------------------------------------------------------------------
+// Library file cache: structures / MD / plots downloaded on demand from the public
+// QDSpace site are stored under <app data>/library-cache/<relative library path>.
+// The webview does the HTTP fetch (CORS is open); Rust only reads and writes files.
+
+const LIBRARY_CACHE_DIR: &str = "library-cache";
+
+fn library_cache_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+  let base = app.path().app_data_dir().map_err(|e| format!("app data dir unavailable: {e}"))?;
+  Ok(base.join(LIBRARY_CACHE_DIR))
+}
+
+fn windows_reserved_name(part: &str) -> bool {
+  let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+  matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+    || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+      && stem.len() == 4
+      && stem.as_bytes()[3].is_ascii_digit())
+}
+
+/// Map a library-relative path (e.g. "II-VI/CdSe/.../relaxed.xyz") into the cache dir.
+/// Rejects absolute paths, "..", drive letters and unexpected characters.
+fn library_cache_file(app: &tauri::AppHandle, rel: &str) -> Result<std::path::PathBuf, String> {
+  let rel = rel.trim().trim_start_matches('/');
+  if rel.is_empty() || rel.len() > 400 {
+    return Err(format!("invalid library path: {rel}"));
+  }
+  let mut path = library_cache_root(app)?;
+  for part in rel.split('/') {
+    let ok_chars = part
+      .chars()
+      .all(|c| c.is_ascii_alphanumeric() || "-_.@[]+=,()".contains(c));
+    if part.is_empty()
+      || part == "."
+      || part == ".."
+      || !ok_chars
+      || part.ends_with('.')
+      || part.ends_with(".part")
+      || windows_reserved_name(part)
+    {
+      return Err(format!("invalid library path: {rel}"));
+    }
+    path.push(part);
+  }
+  Ok(path)
+}
+
+/// Cached file bytes (raw IPC response -> ArrayBuffer in JS). Err("not cached") if absent.
+#[tauri::command]
+async fn library_cache_read(app: tauri::AppHandle, path: String) -> Result<tauri::ipc::Response, String> {
+  let file = library_cache_file(&app, &path)?;
+  match std::fs::read(&file) {
+    Ok(bytes) => Ok(tauri::ipc::Response::new(bytes)),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("not cached".into()),
+    Err(e) => Err(format!("could not read {}: {e}", file.display())),
+  }
+}
+
+/// Save a downloaded library file (written to "<name>.part", then renamed).
+#[tauri::command]
+async fn library_cache_write(app: tauri::AppHandle, path: String, contents: String) -> Result<u64, String> {
+  let file = library_cache_file(&app, &path)?;
+  if let Some(parent) = file.parent() {
+    std::fs::create_dir_all(parent).map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+  }
+  let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+  let tmp = file.with_file_name(format!("{name}.part"));
+  std::fs::write(&tmp, contents.as_bytes()).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+  if let Err(e) = std::fs::rename(&tmp, &file) {
+    let _ = std::fs::remove_file(&tmp);
+    return Err(format!("could not save {}: {e}", file.display()));
+  }
+  Ok(contents.len() as u64)
+}
+
+/// Size of each cached file, None where not cached (or the path is invalid).
+#[tauri::command]
+async fn library_cache_stat(app: tauri::AppHandle, paths: Vec<String>) -> Vec<Option<u64>> {
+  paths
+    .iter()
+    .map(|p| {
+      library_cache_file(&app, p)
+        .ok()
+        .and_then(|f| std::fs::metadata(f).ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+    })
+    .collect()
+}
+
+#[tauri::command]
+fn library_cache_dir(app: tauri::AppHandle) -> Result<String, String> {
+  Ok(library_cache_root(&app)?.display().to_string())
 }

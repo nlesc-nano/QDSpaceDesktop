@@ -25,13 +25,20 @@ export default defineConfig(({ command }) => {
         ? { protocol: 'ws', host, port: 1421 }
         : undefined,
       watch: {
-        ignored: ['**/src-tauri/**', '**/sidecar/**', '**/upstream/**'],
+        ignored: [
+          '**/src-tauri/**', '**/sidecar/**', '**/upstream/**',
+          // Packed Python runtimes: tens of thousands of files Vite must not watch
+          '**/mace-runtime/**', '**/builder-runtime/**', '**/builder-sidecar/**',
+          '**/public-release/**',
+        ],
       },
       proxy: {
         // Existing QDSpace backend (optional)
         '/api': 'http://127.0.0.1:8000',
       },
     },
+    // Only scan the app's own entry for deps, never HTML files inside the packed runtimes
+    optimizeDeps: { entries: ['index.html'] },
     envPrefix: ['VITE_', 'TAURI_'],
   }
 })

@@ -3,11 +3,20 @@
   import { Trajectory } from "matterviz/trajectory";
   import { parse_xyz } from "matterviz/structure/parse";
   import { onMount } from "svelte";
+  import { looksLikeHtml } from "./lib/remoteLibrary.js";
 
   let props = $props();
 
+  // Never hand non-XYZ text (e.g. an HTML page served for a missing file) to the viewers.
+  function viewableXyz(text) {
+    if (!text || looksLikeHtml(text)) return "";
+    const first = String(text).trimStart().split("\n", 1)[0].trim();
+    return /^\d+$/.test(first) ? text : "";
+  }
+  let xyz = $derived(viewableXyz(props.xyz));
+
   // Parse the structure synchronously (used for non-MD single-frame mode)
-  let structure = $derived(props.xyz && !props.isMD ? parse_xyz(props.xyz) : null);
+  let structure = $derived(xyz && !props.isMD ? parse_xyz(xyz) : null);
 
   // Only disable bonds if the structure is truly massive (>5000 atoms) to protect the browser
   let isMassive = $derived(structure ? structure.num_atoms > 5000 : false);
@@ -86,7 +95,7 @@
 
   // Render 3Dmol structure (White background, Orthographic projection, VDW Spheres only)
   function render3dmol() {
-    if (!scriptLoaded3dmol || !container3dmol || !props.xyz || props.isMD) return;
+    if (!scriptLoaded3dmol || !container3dmol || !xyz || props.isMD) return;
     container3dmol.innerHTML = "";
 
     try {
@@ -97,7 +106,7 @@
         });
 
         // Add Model
-        viewer3dmol.addModel(props.xyz, "xyz");
+        viewer3dmol.addModel(xyz, "xyz");
 
         // Style: Spacefill with large VDW spheres (no sticks)
         viewer3dmol.setStyle({}, {
@@ -114,7 +123,7 @@
 
   // Render NGL Viewer structure (White background, VDW spacefill style)
   function renderNgl() {
-    if (!scriptLoadedNgl || !containerNgl || !props.xyz || props.isMD) return;
+    if (!scriptLoadedNgl || !containerNgl || !xyz || props.isMD) return;
     containerNgl.innerHTML = "";
 
     try {
@@ -129,7 +138,7 @@
         });
         stageNgl.setParameters({ cameraType: "orthographic" });
 
-        const file = new File([props.xyz], "structure.xyz", { type: "text/plain" });
+        const file = new File([xyz], "structure.xyz", { type: "text/plain" });
 
         stageNgl.loadFile(file).then(function (o) {
           // Large VDW spacefill representation
@@ -146,7 +155,7 @@
 
   // Render Molstar structure (White background, loadStructureFromUrl)
   function renderMolstar() {
-    if (!scriptLoadedMolstar || !containerMolstar || !props.xyz || props.isMD) return;
+    if (!scriptLoadedMolstar || !containerMolstar || !xyz || props.isMD) return;
     containerMolstar.innerHTML = "";
 
     try {
@@ -192,7 +201,7 @@
           plugin.managers.lociLabels.addProvider(myLabelProvider);
 
           // Custom low-level Molstar loaders to parse coordinates and apply spacefill
-          const blob = new Blob([props.xyz], { type: "text/plain" });
+          const blob = new Blob([xyz], { type: "text/plain" });
           const url = URL.createObjectURL(blob);
 
           try {
@@ -224,19 +233,19 @@
 
   // React to changes in loading status, xyz data, and activeViewer choice (with deferred rendering)
   $effect(() => {
-    if (activeViewer === "3dmol" && scriptLoaded3dmol && props.xyz && container3dmol) {
+    if (activeViewer === "3dmol" && scriptLoaded3dmol && xyz && container3dmol) {
       setTimeout(render3dmol, 50);
     }
   });
 
   $effect(() => {
-    if (activeViewer === "ngl" && scriptLoadedNgl && props.xyz && containerNgl) {
+    if (activeViewer === "ngl" && scriptLoadedNgl && xyz && containerNgl) {
       setTimeout(renderNgl, 50);
     }
   });
 
   $effect(() => {
-    if (activeViewer === "molstar" && scriptLoadedMolstar && props.xyz && containerMolstar) {
+    if (activeViewer === "molstar" && scriptLoadedMolstar && xyz && containerMolstar) {
       setTimeout(renderMolstar, 50);
     }
   });
@@ -273,7 +282,7 @@
 
   <!-- Embedded Selector Toolbar Removed (Moved to header by parent) -->
 
-  {#if !props.xyz && !(props.isMD && props.dataUrl)}
+  {#if !xyz && !(props.isMD && props.dataUrl)}
     <div class="p-4 flex items-center justify-center h-full text-slate-500 font-medium bg-slate-900 rounded-[1.5rem]" style="min-height: 400px; height: 100%;">
       No structure loaded
     </div>
@@ -358,8 +367,8 @@
   {/if}
 
   <!-- Element Legend & Stoichiometry Overlay -->
-  {#if props.xyz && !props.isMD}
-    {@const elements = parseXyzElements(props.xyz)}
+  {#if xyz && !props.isMD}
+    {@const elements = parseXyzElements(xyz)}
     {#if elements.length > 0}
       <div class="absolute bottom-4 left-4 bg-white/90 backdrop-blur-md border border-slate-200/60 p-3 rounded-2xl shadow-lg z-10 max-w-[200px] flex flex-col gap-1.5 pointer-events-auto">
         <h4 class="text-[10px] font-extrabold text-slate-500 uppercase tracking-widest border-b border-slate-100 pb-1 flex items-center gap-1.5">

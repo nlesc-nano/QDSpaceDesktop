@@ -28,7 +28,8 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../mace-runtime/": "mace-runtime/"
+      "../mace-runtime/": "mace-runtime/",
+      "../builder-runtime/": "builder-runtime/"
     },
     "icon": [
       "icons/32x32.png",
