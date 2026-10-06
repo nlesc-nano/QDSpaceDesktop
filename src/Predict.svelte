@@ -4,8 +4,20 @@
 </script>
 
 <script>
+  import { tick } from 'svelte';
   import { SIDECAR_BASE } from './lib/desktop.js';
   import Viewer from './Viewer.svelte';
+  import PredictTrajectory from './PredictTrajectory.svelte';
+  import {
+    clampFrameNumber,
+    rangeIndices,
+    sliceXyzFrames,
+    sourceIndexOf,
+    findResultIndex,
+    maxForceMagnitude,
+    rangeLabel,
+    buildEnergySeries,
+  } from './lib/predictTrajectory.js';
 
   const SAMPLES = [
     { name: 'CsPbBr3', subtitle: '12 Å', file: 'Cs20Pb8Br36_HLE17_12ang_OPT.xyz' },
@@ -45,11 +57,70 @@
   let sourceText = $state('');
   let originalEnergy = $state(null);
   let frameCount = $state(1);
-  let allFrames = $state(false);
+  // Which frames Run predict uses: 'frame' (the one shown), 'range' or 'all'.
+  let predictMode = $state('frame');
+  let rangeStart = $state(1);
+  let rangeEnd = $state(1);
+  let rangeStep = $state(1);
   let shownFrame = $state(0);
-  let structureFrames = $state([]);
+  // Raw: only ever reassigned, and a trajectory can hold thousands of frames.
+  let structureFrames = $state.raw([]);
   let fileInput = $state(null);
   let activeViewer = $state('molstar');
+  // What the MatterViz tab plays for a multi-frame file: input frames or predicted frames.
+  let playerSource = $state('input');
+
+  // Forces list: open by default (not remembered), shown in full; Hide restores the compact layout.
+  let forcesOpen = $state(true);
+  let mainEl = $state(null);
+  let resultsEl = $state(null);
+  function toggleForces() {
+    forcesOpen = !forcesOpen;
+    if (!forcesOpen && mainEl) mainEl.scrollTop = 0;
+  }
+
+  // Once a run finishes, scroll just enough to show the whole forces list (never past the top
+  // of Results), unless the user has already scrolled the panel themselves.
+  async function revealForces() {
+    if (!forcesOpen || !result) return;
+    await tick();
+    const main = mainEl;
+    const panel = resultsEl;
+    if (!main || !panel || main.scrollTop > 8) return;
+    const base = main.getBoundingClientRect().top - main.scrollTop;
+    const panelTop = panel.getBoundingClientRect().top - base;
+    const panelBottom = panel.getBoundingClientRect().bottom - base;
+    if (panelBottom <= main.clientHeight) return;
+    const target = Math.min(panelTop - 16, panelBottom - main.clientHeight + 16);
+    if (target > 0) main.scrollTo({ top: target, behavior: 'smooth' });
+  }
+
+  function resetFrameChoice(count) {
+    predictMode = 'frame';
+    rangeStart = 1;
+    rangeEnd = Math.max(1, count || 1);
+    rangeStep = 1;
+  }
+
+  function applyGoto(event) {
+    const input = event.currentTarget;
+    const n = clampFrameNumber(input.value, structureFrames.length);
+    if (n != null && n - 1 !== shownFrame) selectInputFrame(n - 1);
+    input.value = String(shownFrame + 1);
+  }
+
+  function clampRangeField(name) {
+    const total = Math.max(1, frameCount);
+    if (name === 'step') {
+      const v = Math.round(Number(rangeStep));
+      rangeStep = Number.isFinite(v) && v >= 1 ? Math.min(v, total) : 1;
+      return;
+    }
+    if (name === 'start') rangeStart = clampFrameNumber(rangeStart, total) ?? 1;
+    else rangeEnd = clampFrameNumber(rangeEnd, total) ?? total;
+  }
+
+  let rangeCount = $derived(rangeIndices(rangeStart, rangeEnd, rangeStep, frameCount).length);
   let deviceChoice = $state('cpu');
   let engineChoice = $state('mace');
 
@@ -473,16 +544,44 @@
       fileNote = fileNote.replace(/showing frame \d+/, `showing frame ${index + 1}`);
     }
     if (result?.frames?.length) {
-      const predicted = result.frames[index];
+      const at = findResultIndex(result.frames, index);
+      const predicted = at >= 0 ? result.frames[at] : null;
       if (predicted) {
-        result = { ...result, energy: predicted.energy, forces: predicted.forces, n_atoms: predicted.n_atoms, symbols: predicted.symbols };
-        resultIndex = index;
+        result = { ...result, ...resultFields(predicted, at) };
+        resultIndex = at;
         if (loading) followLatest = false;
       }
     }
   }
 
+  // Fields of the result card for one result frame (keeps which file frame it is).
+  function resultFields(frame, position) {
+    return {
+      energy: frame.energy,
+      forces: frame.forces,
+      n_atoms: frame.n_atoms,
+      symbols: frame.symbols,
+      source_index: sourceIndexOf(frame, position),
+    };
+  }
+
   let xyzData = $derived(payloadToXyz(payloadText));
+  // Card values for the result frame shown (its own original file frame, not the input shown).
+  let resultOriginal = $derived.by(() => {
+    if (result && Number.isInteger(result.source_index) && structureFrames.length) return originalEnergyFor(result.source_index);
+    return originalEnergy;
+  });
+  let resultMaxForce = $derived(result ? maxForceMagnitude(result.forces) : null);
+  // Player: input frames of a multi-frame file, or the predicted frames after a range/all run.
+  let resultFrames = $derived(result?.frames || null);
+  let canPlayInput = $derived(structureFrames.length > 1);
+  let canPlayResults = $derived(!loading && (resultFrames?.length ?? 0) > 1);
+  let playerMode = $derived(canPlayResults && (playerSource === 'results' || !canPlayInput) ? 'results' : 'input');
+  let showPlayer = $derived(activeViewer === 'matterviz' && (canPlayInput || canPlayResults));
+  let forcesExpanded = $derived(forcesOpen && !!result);
+  let resultFrameNumbers = $derived(canPlayResults ? resultFrames.map((frame, i) => sourceIndexOf(frame, i)) : null);
+  // Energy plot for Results Range/All only (not Input, not a single This-frame result).
+  let resultEnergyPlot = $derived(canPlayResults ? buildEnergySeries(resultFrames, originalEnergyFor) : null);
   let downloadName = $derived((structureName.replace(/\.(xyz|json)$/i, '') || 'predict') + '-predicted.xyz');
 
 
@@ -518,7 +617,7 @@
     structureLoaded = true;
     sourceText = '';
     frameCount = 1;
-    allFrames = false;
+    resetFrameChoice(1);
     shownFrame = 0;
     structureFrames = [];
     fileNote = null;
@@ -534,7 +633,7 @@
     fileNote = null;
     originalEnergy = null;
     frameCount = 1;
-    allFrames = false;
+    resetFrameChoice(1);
     shownFrame = 0;
     structureFrames = [];
     result = null;
@@ -587,19 +686,21 @@
     return lines.join('\n');
   }
 
+  // Show result frame `index` (position in result.frames), with its original file frame.
   function showFrame(index) {
-    if (structureFrames.length > 1) {
-      selectInputFrame(index);
-      return;
-    }
     if (!result?.frames?.length) return;
     const frame = result.frames[index];
     if (!frame) return;
-    shownFrame = index;
+    const source = sourceIndexOf(frame, index);
+    if (structureFrames.length > 1 && source < structureFrames.length) {
+      selectInputFrame(source);
+      return;
+    }
+    shownFrame = source;
     resultIndex = index;
     if (loading) followLatest = false;
-    originalEnergy = energyFromXyzFrame(sourceText, index);
-    result = { ...result, energy: frame.energy, forces: frame.forces, n_atoms: frame.n_atoms, symbols: frame.symbols };
+    originalEnergy = energyFromXyzFrame(sourceText, source);
+    result = { ...result, ...resultFields(frame, index) };
     payloadText = JSON.stringify({
       symbols: frame.symbols,
       positions: frame.positions,
@@ -651,9 +752,10 @@
     structureLoaded = true;
     sourceText = '';
     frameCount = 1;
-    allFrames = false;
+    resetFrameChoice(1);
     shownFrame = 0;
     structureFrames = [];
+    playerSource = 'input';
     const name = file.name.toLowerCase();
     if (!name.endsWith('.xyz') && !name.endsWith('.json')) {
       structureName = '';
@@ -692,6 +794,8 @@
         ? (parsed[0]?.energy ?? energyFromXyzFrame(text, 0))
         : null;
       frameCount = parsed.length || data.n_frames || 1;
+      resetFrameChoice(frameCount);
+      if (parsed.length > 1) activeViewer = 'matterviz';
       const frames = frameCount > 1 ? `, ${frameCount} frames (showing frame 1)` : '';
       fileNote = `ASE accepted ${file.name}: ${data.formula}, ${data.n_atoms} atoms (${data.format})${frames}.`;
     } catch (e) {
@@ -777,6 +881,14 @@
     return loading ? null : energyFromXyzFrame(sourceText, index);
   }
 
+  // Record which file frame a result frame came from (a range run sends only some frames).
+  function tagFrame(stream, frame, position) {
+    if (!frame || typeof frame !== 'object') return frame;
+    const source = stream.indexMap ? stream.indexMap[position] : position;
+    frame.source_index = Number.isInteger(source) ? source : position;
+    return frame;
+  }
+
   // Push streamed frames into Results. Throttled so a fast run does not re-render per frame.
   function flushStream(stream) {
     if (stream.timer) {
@@ -795,12 +907,14 @@
       cold_load_s: stream.meta.cold_load_s ?? null,
       n_frames: frames.length,
       frames: frames.slice(),
+      requested: stream.total,
+      range: stream.range || '',
     };
     if (followLatest || !result?.frames) {
       const frame = frames[last];
       resultIndex = last;
-      originalEnergy = originalEnergyFor(last);
-      result = { ...base, energy: frame.energy, forces: frame.forces, n_atoms: frame.n_atoms, symbols: frame.symbols };
+      originalEnergy = originalEnergyFor(sourceIndexOf(frame, last));
+      result = { ...base, ...resultFields(frame, last) };
     } else {
       result = { ...result, ...base };
     }
@@ -861,13 +975,13 @@
     if (controller.signal.aborted) throw new Error('Prediction cancelled');
     if (!data.frames?.length) throw new Error('No frames came back.');
     stream.meta = { device: data.device, model: data.model, latency_ms: data.latency_ms };
-    stream.frames = data.frames;
+    stream.frames = data.frames.map((frame, position) => tagFrame(stream, frame, position));
     followLatest = false;
     flushStream(stream);
-    const first = data.frames[0];
+    const first = stream.frames[0];
     resultIndex = 0;
-    originalEnergy = originalEnergyFor(0);
-    result = { ...result, energy: first.energy, forces: first.forces, n_atoms: first.n_atoms, symbols: first.symbols };
+    originalEnergy = originalEnergyFor(sourceIndexOf(first, 0));
+    result = { ...result, ...resultFields(first, 0) };
   }
 
   async function runFrameStream(stream, controller, request) {
@@ -898,7 +1012,7 @@
             stream.meta = { ...stream.meta, device: event.device, model: event.model, cold_load_s: event.cold_load_s };
             break;
           case 'frame':
-            stream.frames.push(event);
+            stream.frames.push(tagFrame(stream, event, stream.frames.length));
             scheduleFlush(stream);
             break;
           case 'done':
@@ -963,7 +1077,7 @@
     let added = 0;
     for (const frame of data.frames || []) {
       if (frame?.index !== stream.frames.length) continue;
-      stream.frames.push(frame);
+      stream.frames.push(tagFrame(stream, frame, stream.frames.length));
       added += 1;
     }
     return added;
@@ -1063,6 +1177,7 @@
     }
     predictBlockNote = '';
     cancelledNote = '';
+    forcesOpen = true;
     loading = true;
     predictCancelling = false;
     error = null;
@@ -1086,13 +1201,27 @@
       if (!Array.isArray(body.symbols) || !Array.isArray(body.positions)) {
         throw new Error('Payload needs symbols[] and positions[][]');
       }
-      const predictAll = allFrames && frameCount > 1 && sourceText;
+      const multi = frameCount > 1 && sourceText;
       const settings = { device: deviceChoice, engine: engineChoice, model_path: modelPath.trim() || null, head: heads.length > 1 ? headChoice : null };
-      if (predictAll) {
-        stream = { frames: [], total: frameCount, device: deviceChoice, meta: {}, timer: null, jobId: null };
+      if (multi && (predictMode === 'all' || predictMode === 'range')) {
+        let text = sourceText;
+        let indexMap = null;
+        let range = '';
+        let total = frameCount;
+        if (predictMode === 'range') {
+          // Send only the chosen frames; indexMap maps each result back to its file frame.
+          const step = Math.max(1, Math.round(Number(rangeStep)) || 1);
+          const picked = sliceXyzFrames(sourceText, rangeIndices(rangeStart, rangeEnd, step, frameCount));
+          if (!picked.indexMap.length) throw new Error('The frame range is empty.');
+          text = picked.text;
+          indexMap = picked.indexMap;
+          total = indexMap.length;
+          range = rangeLabel(indexMap, step);
+        }
+        stream = { frames: [], total, device: deviceChoice, meta: {}, timer: null, jobId: null, indexMap, range };
         activeStream = stream;
-        streamTotal = frameCount;
-        await runFrameJob(stream, controller, { filename: structureName || 'trajectory.xyz', text: sourceText, ...settings });
+        streamTotal = total;
+        await runFrameJob(stream, controller, { filename: structureName || 'trajectory.xyz', text, ...settings });
       } else {
         const res = await sidecarFetch(`${SIDECAR_BASE}/predict`, {
           method: 'POST',
@@ -1105,7 +1234,7 @@
         if (controller.signal.aborted) {
           throw new Error('Prediction cancelled');
         }
-        result = data;
+        result = multi ? { ...data, source_index: shownFrame } : data;
       }
       clientMs = performance.now() - t0;
     } catch (e) {
@@ -1130,6 +1259,9 @@
       predictCancelling = false;
       // Point the structure viewer at the result frame now shown (it is not reloaded per frame).
       if (stream && result?.frames?.length) showFrame(Math.min(resultIndex, result.frames.length - 1));
+      // Let the player play the predicted frames (energies + forces) after a range/all run.
+      if (stream && result?.frames?.length > 1) playerSource = 'results';
+      if (result) revealForces();
     }
   }
   if (keptHeads) applyHeads(keptHeads.found, keptHeads.selected);
@@ -1210,12 +1342,44 @@
           {#if structureFrames.length > 1}
             <div class="flex items-center justify-center gap-2 mt-2">
               <button type="button" class="px-3 py-1 rounded-lg text-xs font-semibold bg-white text-brand-600 disabled:opacity-40" onclick={() => selectInputFrame(shownFrame - 1)} disabled={shownFrame === 0}>Previous</button>
-              <span class="text-xs font-semibold text-brand-800">Frame {shownFrame + 1} of {structureFrames.length}</span>
+              <span class="flex items-center gap-1 whitespace-nowrap text-xs font-semibold text-brand-800">
+                Frame
+                <input type="number" class="w-16 px-1.5 py-0.5 rounded-md border border-brand-200 bg-white text-center text-xs font-mono" min="1" max={structureFrames.length} value={shownFrame + 1} aria-label="Go to frame" title="Type a frame number and press Enter" onkeydown={(event) => { if (event.key === 'Enter') applyGoto(event); }} onchange={applyGoto} />
+                of {structureFrames.length}
+              </span>
               <button type="button" class="px-3 py-1 rounded-lg text-xs font-semibold bg-white text-brand-600 disabled:opacity-40" onclick={() => selectInputFrame(shownFrame + 1)} disabled={shownFrame >= structureFrames.length - 1}>Next</button>
             </div>
           {/if}
         </div>
-        <div class="flex flex-wrap gap-2 mt-2">
+        {#if frameCount > 1}
+          <div class="mt-3 space-y-2">
+            <span class="block text-xs font-semibold text-slate-600">This file has {frameCount} frames. Predict:</span>
+            <div class="flex space-x-1 rounded-xl p-1 bg-slate-100">
+              <button type="button" class="w-full rounded-lg py-1.5 text-xs font-bold transition-all {predictMode === 'frame' ? 'bg-white text-brand-600 shadow-sm' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}" onclick={() => predictMode = 'frame'} disabled={loading}>This frame</button>
+              <button type="button" class="w-full rounded-lg py-1.5 text-xs font-bold transition-all {predictMode === 'range' ? 'bg-white text-brand-600 shadow-sm' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}" onclick={() => predictMode = 'range'} disabled={loading}>Range</button>
+              <button type="button" class="w-full rounded-lg py-1.5 text-xs font-bold transition-all {predictMode === 'all' ? 'bg-white text-brand-600 shadow-sm' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'}" onclick={() => predictMode = 'all'} disabled={loading}>All frames</button>
+            </div>
+            {#if predictMode === 'frame'}
+              <p class="text-xs text-slate-500">Predicts frame {shownFrame + 1}, the one shown above.</p>
+            {:else if predictMode === 'range'}
+              <div class="grid grid-cols-3 gap-2">
+                <label class="text-[11px] font-semibold text-slate-500">From
+                  <input type="number" class="mt-0.5 w-full px-2 py-1 rounded-lg text-xs border border-slate-200 bg-white font-mono" min="1" max={frameCount} bind:value={rangeStart} onchange={() => clampRangeField('start')} disabled={loading} />
+                </label>
+                <label class="text-[11px] font-semibold text-slate-500">To
+                  <input type="number" class="mt-0.5 w-full px-2 py-1 rounded-lg text-xs border border-slate-200 bg-white font-mono" min="1" max={frameCount} bind:value={rangeEnd} onchange={() => clampRangeField('end')} disabled={loading} />
+                </label>
+                <label class="text-[11px] font-semibold text-slate-500">Step
+                  <input type="number" class="mt-0.5 w-full px-2 py-1 rounded-lg text-xs border border-slate-200 bg-white font-mono" min="1" max={frameCount} bind:value={rangeStep} onchange={() => clampRangeField('step')} disabled={loading} />
+                </label>
+              </div>
+              <p class="text-xs text-slate-500">{rangeCount} frame{rangeCount === 1 ? '' : 's'} will be predicted. Frame numbers are the file's (1 = first).</p>
+            {:else}
+              <p class="text-xs text-slate-500">Predicts all {frameCount} frames.</p>
+            {/if}
+          </div>
+        {/if}
+        <div class="flex flex-wrap gap-2 mt-3">
           <button type="button" class="flex flex-col items-center justify-center px-3 py-2 bg-brand-50 hover:bg-brand-100 text-brand-700 border border-brand-200 rounded-lg transition-colors w-[85px]" onclick={loadDemo}>
             <span class="text-sm font-bold leading-tight">H2O</span>
             <span class="text-[9px] font-bold text-slate-500 uppercase tracking-wider mt-0.5">demo</span>
@@ -1227,12 +1391,6 @@
             </button>
           {/each}
         </div>
-        {#if frameCount > 1}
-          <label class="flex items-start gap-2 mt-2 text-xs text-slate-600">
-            <input type="checkbox" class="mt-0.5" bind:checked={allFrames} />
-            <span>This file has {frameCount} frames. Predict all of them. Leave this off to predict the frame shown above.</span>
-          </label>
-        {/if}
       </div>
 
       <div>
@@ -1315,10 +1473,18 @@
 
   </aside>
 
-  <main class="flex-1 min-w-0 h-full p-4 bg-slate-50 flex flex-col gap-4 overflow-hidden">
-    <div class="flex-1 min-h-0 bg-white rounded-[1.5rem] p-4 border border-slate-100 shadow-sm flex flex-col">
+  <main bind:this={mainEl} class="flex-1 min-w-0 h-full p-4 bg-slate-50 flex flex-col gap-4 {forcesExpanded ? 'overflow-y-auto' : 'overflow-hidden'}">
+    <div class="{forcesExpanded ? 'h-[calc(50%-1rem)] shrink-0' : 'flex-1 min-h-0'} bg-white rounded-[1.5rem] p-4 border border-slate-100 shadow-sm flex flex-col">
       <div class="flex justify-between items-center mb-3 px-2">
-        <h2 class="font-heading font-bold text-xl text-slate-900">Structure</h2>
+        <div class="flex items-center gap-3">
+          <h2 class="font-heading font-bold text-xl text-slate-900">Structure</h2>
+          {#if showPlayer && canPlayInput && canPlayResults}
+            <div class="flex gap-1 bg-slate-100 p-1 rounded-xl border border-slate-200" role="group" aria-label="Trajectory to play">
+              <button class="px-3 py-1 rounded-lg text-xs font-bold transition-all {playerMode === 'input' ? 'bg-white text-brand-600 shadow-sm' : 'text-slate-600'}" onclick={() => playerSource = 'input'}>Input</button>
+              <button class="px-3 py-1 rounded-lg text-xs font-bold transition-all {playerMode === 'results' ? 'bg-white text-brand-600 shadow-sm' : 'text-slate-600'}" onclick={() => playerSource = 'results'}>Results</button>
+            </div>
+          {/if}
+        </div>
         <div class="flex gap-1 bg-slate-100 p-1 rounded-xl border border-slate-200">
           <button class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all {activeViewer === '3dmol' ? 'bg-brand-600 text-white shadow-sm' : 'text-slate-600'}" onclick={() => activeViewer = '3dmol'}>3Dmol</button>
           <button class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all {activeViewer === 'ngl' ? 'bg-brand-600 text-white shadow-sm' : 'text-slate-600'}" onclick={() => activeViewer = 'ngl'}>NGL</button>
@@ -1327,14 +1493,18 @@
         </div>
       </div>
       <div class="flex-1 bg-slate-50 rounded-[1rem] border border-slate-200 overflow-hidden relative">
-        {#if xyzData}
+        {#if showPlayer && playerMode === 'results'}
+          <PredictTrajectory frames={resultFrames} frameNumbers={resultFrameNumbers} current={resultIndex} totalFrames={frameCount} onselect={showFrame} energyPlot={resultEnergyPlot} />
+        {:else if showPlayer}
+          <PredictTrajectory frames={structureFrames} current={shownFrame} totalFrames={structureFrames.length} onselect={selectInputFrame} />
+        {:else if xyzData}
           <Viewer xyz={xyzData} activeViewer={activeViewer} />
         {:else}
           <div class="absolute inset-0 flex items-center justify-center text-sm text-slate-500">Load a structure to see it here.</div>
         {/if}
       </div>
     </div>
-    <div class="h-1/2 shrink-0 bg-white rounded-[1.5rem] p-4 border border-slate-100 shadow-sm overflow-hidden flex flex-col">
+    <div bind:this={resultsEl} class="{forcesExpanded ? 'shrink-0 min-h-[50%]' : 'h-1/2 shrink-0 overflow-hidden'} bg-white rounded-[1.5rem] p-4 border border-slate-100 shadow-sm flex flex-col">
       <div class="flex items-center justify-between mb-2">
         <h2 class="font-heading font-bold text-lg text-slate-900">Results</h2>
         <div class="flex items-center gap-2">
@@ -1365,7 +1535,7 @@
             <div class="divide-y divide-slate-100 text-sm">
               <div class="flex items-center justify-between gap-4 py-1 first:pt-0">
                 <div class="text-slate-500 text-xs">Original energy</div>
-                <div class="font-mono text-base font-bold text-slate-900">{originalEnergy != null ? originalEnergy : '—'}</div>
+                <div class="font-mono text-base font-bold text-slate-900">{resultOriginal != null ? resultOriginal : '—'}</div>
               </div>
               <button type="button" class="flex items-center justify-between gap-4 w-full text-left py-1" onclick={() => openStat = openStat === 'energy' ? null : 'energy'}>
                 <div class="text-slate-500 text-xs">Predicted energy</div>
@@ -1373,8 +1543,14 @@
               </button>
               <div class="flex items-center justify-between gap-4 py-1 last:pb-0">
                 <div class="text-slate-500 text-xs">Energy gap</div>
-                <div class="font-mono text-base font-bold text-slate-900">{originalEnergy != null && result.energy != null ? (result.energy - originalEnergy).toFixed(6) : '—'}</div>
+                <div class="font-mono text-base font-bold text-slate-900">{resultOriginal != null && result.energy != null ? (result.energy - resultOriginal).toFixed(6) : '—'}</div>
               </div>
+              {#if resultMaxForce != null}
+                <div class="flex items-center justify-between gap-4 py-1 last:pb-0">
+                  <div class="text-slate-500 text-xs">Max |F|</div>
+                  <div class="font-mono text-sm font-semibold text-slate-700">{resultMaxForce.toFixed(4)} eV/Å</div>
+                </div>
+              {/if}
             </div>
           </div>
           <div class="flex flex-wrap items-center gap-2 text-sm">
@@ -1404,7 +1580,7 @@
         {#if result.frames?.length > 1 || (loading && result.frames?.length)}
           <div class="flex flex-wrap items-center gap-2 mb-2 text-xs text-slate-600">
             <button class="px-3 py-1 rounded-lg text-xs font-semibold bg-brand-50 text-brand-600 disabled:opacity-40" onclick={() => showFrame(resultIndex - 1)} disabled={resultIndex === 0}>Previous</button>
-            <span>Frame {resultIndex + 1} of {loading ? streamTotal : result.frames.length}</span>
+            <span>Frame {sourceIndexOf(result, resultIndex) + 1}{#if result.range}{' · '}result {resultIndex + 1} of {loading ? streamTotal : result.frames.length} ({result.range}){:else}{' of '}{loading ? streamTotal : frameCount}{/if}</span>
             <button class="px-3 py-1 rounded-lg text-xs font-semibold bg-brand-50 text-brand-600 disabled:opacity-40" onclick={() => showFrame(resultIndex + 1)} disabled={resultIndex >= result.frames.length - 1}>Next</button>
             {#if loading}
               {#if followLatest}
@@ -1412,15 +1588,27 @@
               {:else}
                 <button class="px-3 py-1 rounded-lg text-xs font-semibold bg-brand-600 text-white hover:bg-brand-700" onclick={jumpToLatest}>Follow latest</button>
               {/if}
-            {:else if result.frames.length < frameCount}
-              <span class="text-amber-700">{frameCount - result.frames.length} frames were not predicted.</span>
+            {:else if result.frames.length < (result.requested ?? frameCount)}
+              <span class="text-amber-700">{(result.requested ?? frameCount) - result.frames.length} frames were not predicted.</span>
             {/if}
           </div>
         {:else if frameCount > 1}
-          <p class="text-xs text-slate-500 mb-2">Frame {shownFrame + 1} of {frameCount}. The other frames were not predicted.</p>
+          <p class="text-xs text-slate-500 mb-2">Frame {sourceIndexOf(result, shownFrame) + 1} of {frameCount}{#if result.range} ({result.range}){/if}. The other frames were not predicted.</p>
         {/if}
-        <div class="text-xs font-bold uppercase tracking-wide text-slate-700 mb-1">index  element  fx  fy  fz (eV/Å)</div>
-        <pre class="font-mono text-xs bg-slate-50 rounded-lg p-3 overflow-auto flex-1 border border-slate-100">{forceLines(result.forces)}</pre>
+        {#if Number.isInteger(result.source_index) && result.source_index !== shownFrame && structureFrames.length > 1}
+          <p class="text-xs text-amber-700 mb-2">Frame {shownFrame + 1} has no prediction. Results show frame {result.source_index + 1}.</p>
+        {/if}
+        <div class="flex items-center justify-between gap-2 mb-1">
+          <button type="button" class="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wide text-slate-700 hover:text-brand-600" onclick={toggleForces} aria-expanded={forcesOpen}>
+            <span class="inline-block w-3 transition-transform {forcesOpen ? 'rotate-90' : ''}" aria-hidden="true">▸</span>
+            Forces <span class="font-normal normal-case text-slate-500">({result.forces?.length ?? 0} atoms, eV/Å)</span>
+          </button>
+          <button type="button" class="px-2 py-0.5 rounded-md text-xs font-semibold border border-slate-200 text-slate-600 hover:bg-slate-50" onclick={toggleForces}>{forcesOpen ? 'Hide' : 'Show'}</button>
+        </div>
+        {#if forcesOpen}
+          <div class="font-mono text-[11px] text-slate-500 mb-1 pl-1">index  element  fx  fy  fz</div>
+          <pre class="font-mono text-xs bg-slate-50 rounded-lg p-3 overflow-x-auto border border-slate-100">{forceLines(result.forces || [])}</pre>
+        {/if}
       {/if}
     </div>
   </main>
